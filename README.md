@@ -91,7 +91,7 @@ uv pip install torch torchvision --index-url https://download.pytorch.org/whl/ro
 
 ```bash
 # Currently, `triton._C.libtriton` doesn't declare itself GIL-safe, but it actually works fine—so we
-#     manually disable the GIL with `PYTHON_GIL=0`.
+# manually disable the GIL with `PYTHON_GIL=0`.
 PYTHON_GIL=0 uv run python -m chirrup.web_service.app --model_path /path/to/your/model
 ```
 

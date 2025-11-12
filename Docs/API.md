@@ -10,7 +10,7 @@ Chirrup provides a high-performance, OpenAI-compatible API for RWKV model infere
 
 ```bash
 # Start with default configuration
-uv run python -m chirrup.web_service.app --model_path /path/to/your/model.pth
+PYTHON_GIL=0 uv run python -m chirrup.web_service.app --model_path /path/to/your/model.pth
 ```
 
 ### Command Line Parameters
@@ -32,15 +32,17 @@ The API service supports the following command-line parameters:
 ### Example Configurations
 
 ```bash
-# High-performance configuration for 4 GPU machine
-uv run python -m chirrup.web_service.app \
+# Configuration for 4 GPU machine to provide web service
+PYTHON_GIL=0 uv run python -m chirrup.web_service.app \
   --model_path /path/to/your/model.pth \
   --worker_num 4 \
   --batch_size 32 \
-  --state_cache_size 100
+  --state_cache_size 100 \
+  --host 0.0.0.0 \
+  --port 8000
 
 # Single GPU
-uv run python -m chirrup.web_service.app \
+PYTHON_GIL=0 uv run python -m chirrup.web_service.app \
   --model_path /models/rwkv7-g1a3-1.5b.pth \
   --worker_num 1 \
   --batch_size 16 \
