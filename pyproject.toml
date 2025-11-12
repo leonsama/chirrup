@@ -26,7 +26,7 @@ packages = ["chirrup"]
 torch-cpu = ["torch>=2.8.0"]
 torch-cu129 = ["torch>=2.8.0"]
 torch-cu126 = ["torch>=2.8.0"]
-torch-rocm = ["torch>=2.8.0"]
+# torch-rocm = ["torch==2.9.1+rocm6.4"]
 dev = ["openai>=1.0.0", "requests>=2.32.5", "tqdm>=4.67.1"]
 
 [tool.uv]
@@ -35,7 +35,7 @@ conflicts = [
         { extra = "torch-cpu" },
         { extra = "torch-cu129" },
         { extra = "torch-cu126" },
-        { extra = "torch-rocm" },
+        # { extra = "torch-rocm" },
     ],
 ]
 
@@ -44,8 +44,10 @@ torch = [
     { index = "pytorch-cpu", extra = "torch-cpu" },
     { index = "pytorch-cu129", extra = "torch-cu129" },
     { index = "pytorch-cu126", extra = "torch-cu126" },
-    { index = "pytorch-rocm", extra = "torch-rocm" },
+    # { index = "pytorch-rocm", extra = "torch-rocm" },
 ]
+# 添加 pytorch-triton-rocm 的来源配置
+pytorch-triton-rocm = [{ index = "pytorch-triton-rocm-index" }]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
@@ -65,6 +67,12 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-rocm"
 url = "https://download.pytorch.org/whl/rocm6.4"
+explicit = true
+
+# 添加 pytorch-triton-rocm 索引
+[[tool.uv.index]]
+name = "pytorch-triton-rocm-index"
+url = "https://download.pytorch.org/whl/pytorch-triton-rocm"
 explicit = true
 
 [tool.black]
