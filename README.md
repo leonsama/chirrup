@@ -14,10 +14,10 @@
 
 ### November 12, 2025
 
-| GPU Configuration   | Model | Workers | Batch Size/Worker | Total Concurrent Requests | Tokens/Second per Request |
-| ------------------- | ----- | ------- | ----------------- | ------------------------- | ------------------------- |
-| 4 × RTX 4090 24GB   | 7.2B  | 4       | 200               | 800                       | 16 tps                    |
-| 4 × Tesla V100 16GB | 7.2B  | 4       | 34                | 136                       | 17 tps                    |
+| GPU Configuration   | Model | Workers | BSZ/Worker | Total Concurrent Requests | TPS per Request |
+| ------------------- | ----- | ------- | ---------- | ------------------------- | --------------- |
+| 4 × RTX 4090 24GB   | 7.2B  | 4       | 200        | 800                       | 16 tps          |
+| 4 × Tesla V100 16GB | 7.2B  | 4       | 34         | 136                       | 17 tps          |
 
 > **Note**: The RTX 4090 configuration is far from the GPU's processing limits, with significant optimization potential remaining.
 
@@ -37,19 +37,6 @@
 - [ ] Constrained decoding (e.g., JSON schema)
 - [ ] Function Calling support
 - [ ] Pipeline parallelism to enable inference of even larger models
-
----
-
-## � Performance
-
-### November 12, 2025
-
-| GPU Configuration   | Model | Workers | Batch Size/Worker | Total Concurrent Requests | Tokens/Second per Request |
-| ------------------- | ----- | ------- | ----------------- | ------------------------- | ------------------------- |
-| 4 × RTX 4090 24GB   | 7.2B  | 4       | 200               | 800                       | 16 tps                    |
-| 4 × Tesla V100 16GB | 7.2B  | 4       | 34                | 136                       | 17 tps                    |
-
-> **Note**: The RTX 4090 configuration is far from the GPU's processing limits, with significant optimization potential remaining.
 
 ---
 
