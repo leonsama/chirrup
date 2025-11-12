@@ -71,6 +71,16 @@ uv sync --extra torch-cu129 --extra dev
 
 > 💡 You may use `torch-cu126` or `torch-rocm` instead if your system requires it, or customize the PyTorch backend in `pyproject.toml`.
 
+> If you are ROCm device, you need to use this script to install dependencies
+
+```bash
+git clone --recurse-submodules https://github.com/leonsama/chirrup.git
+uv venv --python 3.14t
+source .venv/bin/activate
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.4
+uv pip install fastapi ninja numpy pydantic pydantic-settings pyyaml snowflake-id uvicorn
+```
+
 ---
 
 ## 🌐 Start API Service
