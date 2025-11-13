@@ -629,4 +629,4 @@ if __name__ == "__main__":
     config = get_config()
 
     # 启动服务器
-    uvicorn.run("app:app", host=config.host, port=config.port, reload=False, log_level="info")
+    uvicorn.run(app, host=config.host, port=config.port, reload=False, log_level="info")
