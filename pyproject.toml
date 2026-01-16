@@ -79,4 +79,5 @@ dev = [
     "tqdm>=4.67.1",
     "ipykernel>=7.1.0",
     "ipython>=9.7.0",
+    "pyinstrument>=5.1.1",
 ]

@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 import enum
 import asyncio
+import queue
 from typing import List, Optional, Union, Tuple, Dict
 from typing_extensions import TypedDict
 import torch
@@ -136,20 +137,20 @@ class Task:
     """
 
     output_queue: asyncio.Queue[Union[Tuple[int, str], "Task"]]
-    task_event_queue: asyncio.Queue
+    task_event_queue: queue.Queue  # 线程安全队列，用于 abort 等控制信号
     prompt_str: str
     prefill_tokens: List[int]
     state: Union[None, List[torch.Tensor]]
     task_id: Optional[str] = None
     priority: int = 0
 
-    temperature: float = (DEFAULT_SAMPLING_CONFIG["temperature"],)
-    top_p: float = (DEFAULT_SAMPLING_CONFIG["top_p"],)
-    top_k: int = (DEFAULT_SAMPLING_CONFIG["top_k"],)
-    presence_penalty: float = (DEFAULT_SAMPLING_CONFIG["presence_penalty"],)
-    frequency_penalty: float = (DEFAULT_SAMPLING_CONFIG["frequency_penalty"],)
-    penalty_decay: float = (DEFAULT_SAMPLING_CONFIG["penalty_decay"],)
-    max_tokens: Optional[int] = (DEFAULT_SAMPLING_CONFIG["max_tokens"],)
+    temperature: float = DEFAULT_SAMPLING_CONFIG["temperature"]
+    top_p: float = DEFAULT_SAMPLING_CONFIG["top_p"]
+    top_k: int = DEFAULT_SAMPLING_CONFIG["top_k"]
+    presence_penalty: float = DEFAULT_SAMPLING_CONFIG["presence_penalty"]
+    frequency_penalty: float = DEFAULT_SAMPLING_CONFIG["frequency_penalty"]
+    penalty_decay: float = DEFAULT_SAMPLING_CONFIG["penalty_decay"]
+    max_tokens: Optional[int] = DEFAULT_SAMPLING_CONFIG["max_tokens"]
 
     stop_tokens: List[int] = field(default_factory=lambda: DEFAULT_STOP_TOKENS)
     forbidden_tokens: List[int] = field(default_factory=list)

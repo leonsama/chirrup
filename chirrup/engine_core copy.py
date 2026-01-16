@@ -13,7 +13,7 @@ from chirrup.core_structure import (
     DEFAULT_STOP_TOKENS,
 )
 from chirrup.interface import AsyncEngineCompletion
-from chirrup.worker import Worker, TRIE_TOKENIZER
+from chirrup.worker import Worker, TRIE_TOKENIZER, configure_global_thread_pool, shutdown_global_thread_pool
 
 
 class WorkerPerformanceInfo(TypedDict):
@@ -80,7 +80,7 @@ class AsyncEngineCore:
         # 初始化分词器
         self.tokenizer: TRIE_TOKENIZER = None
 
-    def init(self, worker_num: int, model_config: ModelLoadConfig, batch_size: int = 32) -> asyncio.Task:
+    def init(self, worker_num: int, model_config: ModelLoadConfig, batch_size: int = 32, thread_pool_max_workers: Optional[int] = None) -> asyncio.Task:
         """
         初始化 Worker，返回一个异步任务，当全部 worker 都加载成功后完成
 
@@ -88,6 +88,7 @@ class AsyncEngineCore:
             worker_num: Worker 数量
             model_config: 模型配置
             batch_size: 批处理大小
+            thread_pool_max_workers: 全局线程池最大工作线程数，默认为 cpu_count - worker_num - 1
 
         Returns:
             asyncio.Task: 当所有 worker 加载完成后完成的异步任务
@@ -97,6 +98,9 @@ class AsyncEngineCore:
 
         if self.is_shutdown:
             raise RuntimeError("Engine has been shutdown")
+
+        # 初始化全局线程池
+        configure_global_thread_pool(worker_num, thread_pool_max_workers)
 
         # 获取当前事件循环
         try:
@@ -277,6 +281,9 @@ class AsyncEngineCore:
         for thread in self.worker_threads:
             if thread.is_alive():
                 thread.join(timeout=5)
+
+        # 关闭全局线程池
+        shutdown_global_thread_pool()
 
     async def iter_worker_performance(
         self, timeout: float = 1.0

@@ -9,3 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .venv-3.14t
+
+local-dev/
+*.prof
+*.prof.svg

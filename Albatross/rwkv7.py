@@ -4,7 +4,7 @@
 #
 ########################################################################################################
 
-from typing import List
+from typing import List, Union
 import os
 current_path = os.path.dirname(os.path.abspath(__file__))
 
@@ -162,7 +162,7 @@ def _(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torc
 ########################################################################################################
 
 class RWKV_x070(MyModule):
-    def __init__(self, args):
+    def __init__(self, args, auto_load:Union[bool,list[str]]=True):
         super().__init__()
         self.args = args
         args.head_size = 64
@@ -182,21 +182,44 @@ class RWKV_x070(MyModule):
             kk = k.split('.')
             # if kk[0] == 'blocks' and int(kk[1]) >= 10:
             #     continue
-            if 'att.g1' in k or 'att.g2' in k or 'att.a1' in k or 'att.a2' in k or 'att.w1' in k or 'att.w2' in k or 'att.v1' in k or 'att.v2' in k or 'ffn.value.weight' in k:
-                z[k] = z[k].t()
-            z[k] = z[k].squeeze().to(dtype=DTYPE, device="cuda")
-            if k.endswith('att.r_k'): z[k] = z[k].flatten()
-            z[k] = z[k].contiguous()
+            # if 'att.g1' in k or 'att.g2' in k or 'att.a1' in k or 'att.a2' in k or 'att.w1' in k or 'att.w2' in k or 'att.v1' in k or 'att.v2' in k or 'ffn.value.weight' in k:
+            #     z[k] = z[k].t()
+            # z[k] = z[k].squeeze().to(dtype=DTYPE, device="cuda")
+            # if k.endswith('att.r_k'): z[k] = z[k].flatten()
+            # z[k] = z[k].contiguous()
             if kk[0] == 'blocks':
                 max_layer = max(max_layer, int(kk[1]))
         args.n_layer = max_layer + 1
         print(args)
         self.n_layer, self.n_embd = args.n_layer, args.n_embd
 
-        z['emb.weight'] = F.layer_norm(z['emb.weight'], (args.n_embd,), weight=z['blocks.0.ln0.weight'], bias=z['blocks.0.ln0.bias'])
-        z['blocks.0.att.v0'] = z['blocks.0.att.a0'] # actually ignored
-        z['blocks.0.att.v1'] = z['blocks.0.att.a1'] # actually ignored
-        z['blocks.0.att.v2'] = z['blocks.0.att.a2'] # actually ignored
+        # z['emb.weight'] = F.layer_norm(z['emb.weight'], (args.n_embd,), weight=z['blocks.0.ln0.weight'], bias=z['blocks.0.ln0.bias'])
+        # z['blocks.0.att.v0'] = z['blocks.0.att.a0'] # actually ignored
+        # z['blocks.0.att.v1'] = z['blocks.0.att.a1'] # actually ignored
+        # z['blocks.0.att.v2'] = z['blocks.0.att.a2'] # actually ignored
+
+        weights_group = self.get_gpu_parameter_groups()
+        if auto_load == True:
+            device = "cuda"
+            for i in weights_group:
+                self.load_weights_to_device(i["keys"],device)
+            z['emb.weight'] = F.layer_norm(z['emb.weight'], (args.n_embd,), weight=z['blocks.0.ln0.weight'], bias=z['blocks.0.ln0.bias'])
+            z['blocks.0.att.v0'] = z['blocks.0.att.a0'] # actually ignored
+            z['blocks.0.att.v1'] = z['blocks.0.att.a1'] # actually ignored
+            z['blocks.0.att.v2'] = z['blocks.0.att.a2'] # actually ignored
+        
+    def load_weights_to_device(self,keys:list[str],device):
+        z = self.z
+        for k in keys:
+            kk = k.split('.')
+            # if kk[0] == 'blocks' and int(kk[1]) >= 10:
+            #     continue
+            if 'att.g1' in k or 'att.g2' in k or 'att.a1' in k or 'att.a2' in k or 'att.w1' in k or 'att.w2' in k or 'att.v1' in k or 'att.v2' in k or 'ffn.value.weight' in k:
+                z[k] = z[k].t()
+            z[k] = z[k].squeeze().to(dtype=DTYPE, device=device)
+            if k.endswith('att.r_k'): z[k] = z[k].flatten()
+            z[k] = z[k].contiguous()
+
 
     def generate_zero_state(self, bsz):
         args = self.args
@@ -324,7 +347,7 @@ class RWKV_x070(MyModule):
             x = F.linear(x, z['head.weight'])
             state[2] += len(idx)
             return x
-        
+
     @MyFunction
     def forward_seq_batch(self, idxs:List[List[int]], state:List[torch.Tensor], full_output:bool=False):
         with torch.no_grad(): 
@@ -357,6 +380,153 @@ class RWKV_x070(MyModule):
             x = F.linear(x, z['head.weight'])
             state[2] += len(idxs[0])
             return x
+
+    def get_gpu_parameter_groups(self):
+            """
+            return: list[{size:int, keys:list[str]}]
+            """
+            groups = []
+            
+            # 1. _forward_seq_batch_pre
+            pre_keys = [f'emb.weight',"blocks.0.ln0.weight","blocks.0.ln0.bias"]
+            pre_size = sum(self.z[k].numel() * self.z[k].element_size() for k in pre_keys)
+            groups.append({'size': pre_size, 'keys': pre_keys})
+            
+            # 2. _forward_seq_batch_layers
+            for i in range(self.n_layer):
+                layer_keys = []
+                layer_size = 0
+                
+                # Layer norm 1
+                bbb = f'blocks.{i}.'
+                att = f'blocks.{i}.att.'
+                ffn = f'blocks.{i}.ffn.'
+                
+                # ln1
+                for k in ['ln1.weight', 'ln1.bias']:
+                    key = bbb + k
+                    layer_keys.append(key)
+                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                
+                # attention parameters
+                for k in ['x_r', 'x_w', 'x_k', 'x_v', 'x_a', 'x_g']:
+                    key = att + k
+                    layer_keys.append(key)
+                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                
+                # attention weights
+                for k in ['w0', 'w1', 'w2']:
+                    key = att + k
+                    layer_keys.append(key)
+                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                
+                # attention a/v/g parameters
+                for k in ['a0', 'a1', 'a2', 'v0', 'v1', 'v2', 'g1', 'g2']:
+                    key = att + k
+                    layer_keys.append(key)
+                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                
+                # attention k/k_a/r_k
+                for k in ['k_k', 'k_a', 'r_k']:
+                    key = att + k
+                    layer_keys.append(key)
+                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                
+                # attention linear weights
+                for k in ['receptance.weight', 'key.weight', 'value.weight', 'output.weight']:
+                    key = att + k
+                    layer_keys.append(key)
+                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                
+                # attention layer norm
+                for k in ['ln_x.weight', 'ln_x.bias']:
+                    key = att + k
+                    layer_keys.append(key)
+                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                
+                # ffn layer norm
+                for k in ['ln2.weight', 'ln2.bias']:
+                    key = bbb + k
+                    layer_keys.append(key)
+                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                
+                # ffn parameters
+                for k in ['x_k', 'key.weight', 'value.weight']:
+                    key = ffn + k
+                    layer_keys.append(key)
+                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                
+                groups.append({'size': layer_size, 'keys': layer_keys})
+            
+            # 3. _forward_seq_batch_post
+            post_keys = ['ln_out.weight', 'ln_out.bias', 'head.weight']
+            post_size = sum(self.z[k].numel() * self.z[k].element_size() for k in post_keys)
+            groups.append({'size': post_size, 'keys': post_keys})
+            
+            return groups
+
+
+    @MyFunction
+    def _forward_seq_batch_pre(self, idxs: List[List[int]]):
+        with torch.no_grad():
+            z = self.z
+            x = z['emb.weight'][torch.tensor(idxs, device=z['emb.weight'].device)]
+            v_first = torch.empty_like(x)
+            return x, v_first
+
+
+    @MyFunction
+    def _forward_seq_batch_layers(self, x: torch.Tensor,
+                                v_first: torch.Tensor,
+                                state: List[torch.Tensor], layer_pos:tuple[int,int]):
+        with torch.no_grad():
+            z = self.z
+            for i in range(layer_pos[0],layer_pos[1]):
+                bbb = f'blocks.{i}.'
+                att = f'blocks.{i}.att.'
+                ffn = f'blocks.{i}.ffn.'
+
+                xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias'])
+
+                xx, v_first = RWKV_x070_TMix_seq_batch(i, self.n_head, self.head_size, xx, state[0][i], v_first, state[1][i],
+                    z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
+                    z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
+                    z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
+                    z[att+'receptance.weight'], z[att+'key.weight'], z[att+'value.weight'], z[att+'output.weight'],
+                    z[att+'ln_x.weight'], z[att+'ln_x.bias'], state[2])
+                x = x + xx
+
+                xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias'])
+
+                xx = RWKV_x070_CMix_seq_batch(xx, state[0][i], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight'])
+                x = x + xx
+            return x, v_first
+
+    @MyFunction
+    def _forward_seq_batch_post(self, x: torch.Tensor,
+                                full_output: bool,
+                                state: List[torch.Tensor],
+                                n_tokens: int):
+        with torch.no_grad():
+            z = self.z
+            if not full_output:
+                x = x[:, -1, :]          # 只取最后一个时间步
+            x = F.layer_norm(x, (self.n_embd,),
+                            weight=z['ln_out.weight'],
+                            bias=z['ln_out.bias'])
+            x = F.linear(x, z['head.weight'])
+            state[2] += n_tokens
+            return x
+
+    def forward_seq_batch_seperate(self, idxs: List[List[int]],
+                        state: List[torch.Tensor],
+                        full_output: bool = False):
+        # 1) 预处理
+        x, v_first = self._forward_seq_batch_pre(idxs)
+        # 2) 中间循环
+        x, v_first = self._forward_seq_batch_layers(x, v_first, state, (0, self.n_layer))
+        # 3) 后处理
+        return self._forward_seq_batch_post(x, full_output, state, len(idxs[0]))
 
 ########################################################################################################
 

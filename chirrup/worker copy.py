@@ -4,6 +4,8 @@ import gc
 import types
 import time
 import threading
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Any, Tuple
 import torch
 from collections import deque
@@ -80,6 +82,50 @@ def min_swaps_to_target_fast(lst, elements: list[int]):
 # 全局模型编译锁，防止多线程同时编译 Torch JIT 模型
 _MODEL_COMPILE_LOCK = threading.Lock()
 _MODEL_COMPILE_DONE = False
+
+# 全局线程池，所有 Worker 实例共享
+_GLOBAL_THREAD_POOL: Optional[ThreadPoolExecutor] = None
+_THREAD_POOL_LOCK = threading.Lock()
+
+
+def configure_global_thread_pool(worker_count: int, max_workers: Optional[int] = None) -> ThreadPoolExecutor:
+    """
+    配置全局线程池
+    
+    Args:
+        worker_count: Worker 线程数量
+        max_workers: 线程池最大工作线程数，默认为 cpu_count - worker_count - 1
+    
+    Returns:
+        配置好的线程池实例
+    """
+    global _GLOBAL_THREAD_POOL
+    
+    with _THREAD_POOL_LOCK:
+        if _GLOBAL_THREAD_POOL is not None:
+            return _GLOBAL_THREAD_POOL
+        
+        if max_workers is None:
+            cpu_count = os.cpu_count() or 4
+            max_workers = max(1, cpu_count - worker_count - 1)
+        
+        _GLOBAL_THREAD_POOL = ThreadPoolExecutor(max_workers=max_workers)
+        return _GLOBAL_THREAD_POOL
+
+
+def get_global_thread_pool() -> Optional[ThreadPoolExecutor]:
+    """获取全局线程池实例"""
+    return _GLOBAL_THREAD_POOL
+
+
+def shutdown_global_thread_pool():
+    """关闭全局线程池"""
+    global _GLOBAL_THREAD_POOL
+    
+    with _THREAD_POOL_LOCK:
+        if _GLOBAL_THREAD_POOL is not None:
+            _GLOBAL_THREAD_POOL.shutdown(wait=True)
+            _GLOBAL_THREAD_POOL = None
 
 
 class StateCategory(IntEnum):
@@ -527,6 +573,49 @@ class Worker:
                 "prefilled_tokens": [],
             }
 
+    def _process_single_slot(self, key: int, task_data: TaskData) -> None:
+        """
+        处理单个 slot 的任务，包括状态检查、前向处理和完成处理。
+        此方法设计为可在线程池中并行执行。
+        
+        Args:
+            key: slot 位置索引
+            task_data: 该 slot 的任务数据
+        """
+        assert (
+            task_data["state_category"] != StateCategory.FINISHED
+        ), f"Invalid state category: {task_data['state_category']}"
+
+        if task_data["state_category"] == StateCategory.EMPTY:
+            return
+
+        if self._is_task_aborted(task_data):
+            task_data["task"].request_status = RequestStatus.FINISHED_ABORTED
+            task_data["state_category"] = StateCategory.FINISHED
+
+        elif task_data["state_category"] == StateCategory.FORWARD_SEQ:
+            self._handle_forward_seq(task_data, key)
+
+        elif task_data["state_category"] == StateCategory.FORWARD_ONE:
+            if task_data["is_prefilling"]:
+                self._handle_forward_one_prefill_phase(task_data, key)
+            else:
+                self._handle_forward_one_decode_phase(task_data, key)
+
+        # 处理已完成的任务（原 _process_accomplished_tasks 的功能）
+        if RequestStatus.is_finished(task_data["task"].request_status):
+            task_data["task"].output_queue.put_nowait(
+                ("task_completed", task_data["task"])
+            )
+            self.state_slot[key] = {
+                "task": None,
+                "is_prefilling": None,
+                "new_token": None,
+                "next_input_token": None,
+                "state_category": StateCategory.EMPTY,
+                "prefilled_tokens": [],
+            }
+
     def _fill_task_pool(self):
         """填充任务池直到达到 batch_size"""
         prefill_count = 0
@@ -735,34 +824,29 @@ class Worker:
             if should_shutdown:
                 break
 
-            accomplished_task_slot_pos: list[int] = []
-
-            for key, task_data in sorted(self.state_slot.items()):
-
-                assert (
-                    task_data["state_category"] != StateCategory.FINISHED
-                ), f"Invalid state category: {task_data['state_category'] }"
-
-                if task_data["state_category"] == StateCategory.EMPTY:
-                    continue
-
-                if self._is_task_aborted(task_data):
-                    task_data["task"].request_status = RequestStatus.FINISHED_ABORTED
-                    task_data["state_category"] = StateCategory.FINISHED
-
-                elif task_data["state_category"] == StateCategory.FORWARD_SEQ:
-                    self._handle_forward_seq(task_data, key)
-
-                elif task_data["state_category"] == StateCategory.FORWARD_ONE:
-                    if task_data["is_prefilling"]:
-                        self._handle_forward_one_prefill_phase(task_data, key)
-                    else:
-                        self._handle_forward_one_decode_phase(task_data, key)
-
-                if RequestStatus.is_finished(task_data["task"].request_status):
-                    accomplished_task_slot_pos.append(key)
-
-            self._process_accomplished_tasks(accomplished_task_slot_pos)
+            # 使用线程池并行处理各个 slot
+            thread_pool = get_global_thread_pool()
+            if thread_pool is not None:
+                # 收集需要处理的 slot
+                slots_to_process = [
+                    (key, task_data)
+                    for key, task_data in sorted(self.state_slot.items())
+                    if task_data["state_category"] != StateCategory.EMPTY
+                ]
+                
+                # 并行提交任务并等待完成
+                futures = [
+                    thread_pool.submit(self._process_single_slot, key, task_data)
+                    for key, task_data in slots_to_process
+                ]
+                
+                # 等待所有任务完成
+                for future in futures:
+                    future.result()
+            else:
+                # 如果线程池未初始化，回退到串行处理
+                for key, task_data in sorted(self.state_slot.items()):
+                    self._process_single_slot(key, task_data)
 
             self._fill_task_pool()
 
