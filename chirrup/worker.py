@@ -10,6 +10,7 @@ from collections import deque
 
 from chirrup.core_structure import Task, ModelLoadConfig, RequestStatus, FinishReason
 from chirrup.utils.samplers import sample_logits_real_batch
+from chirrup.utils.rapid_sampling_wrapper import load_rapid_sampling
 
 # 定义TaskData的类型结构
 from typing_extensions import TypedDict
@@ -117,6 +118,7 @@ class Worker:
         master_event_queue: queue.Queue,
         worker_event_queue: queue.Queue,
         batch_size: int = 32,
+        enable_rapid_sampling: bool = False,
     ):
         """
         初始化 Worker
@@ -127,6 +129,7 @@ class Worker:
             task_queue: 任务队列，Worker 消费该队列
             master_event_queue: 事件队列，包含调度要求
             batch_size: 批处理大小
+            enable_rapid_sampling: 是否启用 Rapid-Sampling 采样
         """
         self.worker_id = worker_id
         self.gpu_id = gpu_id
@@ -167,6 +170,12 @@ class Worker:
         self.presence_penalty_tensor: torch.Tensor = None
 
         self.no_penalty_token_ids = {33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58}
+
+        # Rapid-Sampling 相关
+        self.enable_rapid_sampling = enable_rapid_sampling
+        self.rapid_sampling_module = None
+        self.rapid_sampling_states: torch.Tensor = None
+        self.penalties: torch.Tensor = None  # rapid-sampling 使用的 penalties tensor
 
         # seq foward
         self.min_forward_seq_len = 10
@@ -254,46 +263,61 @@ class Worker:
 
         # 预分配
         self.batch_state = self.model.generate_zero_state(self.real_state_size)
-        self.occurrence = torch.zeros(
-            (self.real_state_size, self.model_config.vocab_size),
-            dtype=torch.float32,
-            device=self.batch_state[0].device,
-        )
-        self.alpha_presence_vector = torch.zeros(
-            (self.real_state_size, self.model_config.vocab_size),
-            dtype=torch.float32,
-            device=self.batch_state[0].device,
-        )
-        self.temperature_tensor = torch.zeros(
-            (self.real_state_size, 1),
-            dtype=torch.float16,
-            device=self.batch_state[0].device,
-        )
-        self.top_p_tensor = torch.zeros(
-            (self.real_state_size, 1),
-            dtype=torch.float16,
-            device=self.batch_state[0].device,
-        )
-        self.top_k_tensor = torch.zeros(
-            (self.real_state_size, 1),
-            dtype=torch.int32,
-            device=self.batch_state[0].device,
-        )
-        self.frequency_penalty_tensor = torch.zeros(
-            (self.real_state_size, 1),
-            dtype=torch.float16,
-            device=self.batch_state[0].device,
-        )
-        self.penalty_decay_tensor = torch.zeros(
-            (self.real_state_size, 1),
-            dtype=torch.float16,
-            device=self.batch_state[0].device,
-        )
-        self.presence_penalty_tensor = torch.zeros(
-            (self.real_state_size, 1),
-            dtype=torch.float32,
-            device=self.batch_state[0].device,
-        )
+
+        # Rapid-Sampling 初始化
+        if self.enable_rapid_sampling:
+            self.rapid_sampling_module = load_rapid_sampling()
+            self.rapid_sampling_states = self.rapid_sampling_module.setup_rand(42, self.real_state_size)
+            self.penalties = torch.zeros(
+                (self.real_state_size, self.model_config.vocab_size),
+                dtype=torch.float32,
+                device=self.batch_state[0].device,
+            )
+            print(f"[{self.worker_id}] Rapid-Sampling 已启用")
+        else:
+            self.occurrence = torch.zeros(
+                (self.real_state_size, self.model_config.vocab_size),
+                dtype=torch.float32,
+                device=self.batch_state[0].device,
+            )
+            self.alpha_presence_vector = torch.zeros(
+                (self.real_state_size, self.model_config.vocab_size),
+                dtype=torch.float32,
+                device=self.batch_state[0].device,
+            )
+            self.temperature_tensor = torch.zeros(
+                (self.real_state_size, 1),
+                dtype=torch.float16,
+                device=self.batch_state[0].device,
+            )
+            self.top_p_tensor = torch.zeros(
+                (self.real_state_size, 1),
+                dtype=torch.float16,
+                device=self.batch_state[0].device,
+            )
+            self.top_k_tensor = torch.zeros(
+                (self.real_state_size, 1),
+                dtype=torch.int32,
+                device=self.batch_state[0].device,
+            )
+            self.frequency_penalty_tensor = torch.zeros(
+                (self.real_state_size, 1),
+                dtype=torch.float16,
+                device=self.batch_state[0].device,
+            )
+            self.penalty_decay_tensor = torch.zeros(
+                (self.real_state_size, 1),
+                dtype=torch.float16,
+                device=self.batch_state[0].device,
+            )
+            self.presence_penalty_tensor = torch.zeros(
+                (self.real_state_size, 1),
+                dtype=torch.float32,
+                device=self.batch_state[0].device,
+            )
+
+            print(f"[{self.worker_id}] Rapid-Sampling 未启用")
+
 
     def _switch_batch(self, pos_a: int, pos_b: int):
         if pos_a == pos_b:
@@ -320,39 +344,45 @@ class Worker:
         self.batch_state[1][:, [pos_b], :, :] = self.batch_state[1][:, [self.real_state_size - 1], :, :]
         self.batch_state[2][[pos_b]] = self.batch_state[2][[self.real_state_size - 1]]
 
+        # Rapid-Sampling penalties
+        if self.enable_rapid_sampling:
+            self.penalties[[self.real_state_size - 1], :] = self.penalties[[pos_a], :]
+            self.penalties[[pos_a], :] = self.penalties[[pos_b], :]
+            self.penalties[[pos_b], :] = self.penalties[[self.real_state_size - 1], :]
+        else:
         # occurrence
-        self.occurrence[[self.real_state_size - 1], :] = self.occurrence[[pos_a], :]
-        self.occurrence[[pos_a], :] = self.occurrence[[pos_b], :]
-        self.occurrence[[pos_b], :] = self.occurrence[[self.real_state_size - 1], :]
+            self.occurrence[[self.real_state_size - 1], :] = self.occurrence[[pos_a], :]
+            self.occurrence[[pos_a], :] = self.occurrence[[pos_b], :]
+            self.occurrence[[pos_b], :] = self.occurrence[[self.real_state_size - 1], :]
 
-        self.alpha_presence_vector[[self.real_state_size - 1], :] = self.alpha_presence_vector[[pos_a], :]
-        self.alpha_presence_vector[[pos_a], :] = self.alpha_presence_vector[[pos_b], :]
-        self.alpha_presence_vector[[pos_b], :] = self.alpha_presence_vector[[self.real_state_size - 1], :]
+            self.alpha_presence_vector[[self.real_state_size - 1], :] = self.alpha_presence_vector[[pos_a], :]
+            self.alpha_presence_vector[[pos_a], :] = self.alpha_presence_vector[[pos_b], :]
+            self.alpha_presence_vector[[pos_b], :] = self.alpha_presence_vector[[self.real_state_size - 1], :]
 
-        self.frequency_penalty_tensor[[self.real_state_size - 1], :] = self.frequency_penalty_tensor[[pos_a], :]
-        self.frequency_penalty_tensor[[pos_a], :] = self.frequency_penalty_tensor[[pos_b], :]
-        self.frequency_penalty_tensor[[pos_b], :] = self.frequency_penalty_tensor[[self.real_state_size - 1], :]
+            self.frequency_penalty_tensor[[self.real_state_size - 1], :] = self.frequency_penalty_tensor[[pos_a], :]
+            self.frequency_penalty_tensor[[pos_a], :] = self.frequency_penalty_tensor[[pos_b], :]
+            self.frequency_penalty_tensor[[pos_b], :] = self.frequency_penalty_tensor[[self.real_state_size - 1], :]
 
-        self.penalty_decay_tensor[[self.real_state_size - 1], :] = self.penalty_decay_tensor[[pos_a], :]
-        self.penalty_decay_tensor[[pos_a], :] = self.penalty_decay_tensor[[pos_b], :]
-        self.penalty_decay_tensor[[pos_b], :] = self.penalty_decay_tensor[[self.real_state_size - 1], :]
+            self.penalty_decay_tensor[[self.real_state_size - 1], :] = self.penalty_decay_tensor[[pos_a], :]
+            self.penalty_decay_tensor[[pos_a], :] = self.penalty_decay_tensor[[pos_b], :]
+            self.penalty_decay_tensor[[pos_b], :] = self.penalty_decay_tensor[[self.real_state_size - 1], :]
 
-        # sample params
-        self.temperature_tensor[[self.real_state_size - 1], :] = self.temperature_tensor[[pos_a], :]
-        self.temperature_tensor[[pos_a], :] = self.temperature_tensor[[pos_b], :]
-        self.temperature_tensor[[pos_b], :] = self.temperature_tensor[[self.real_state_size - 1], :]
+            # sample params
+            self.temperature_tensor[[self.real_state_size - 1], :] = self.temperature_tensor[[pos_a], :]
+            self.temperature_tensor[[pos_a], :] = self.temperature_tensor[[pos_b], :]
+            self.temperature_tensor[[pos_b], :] = self.temperature_tensor[[self.real_state_size - 1], :]
 
-        self.top_p_tensor[[self.real_state_size - 1], :] = self.top_p_tensor[[pos_a], :]
-        self.top_p_tensor[[pos_a], :] = self.top_p_tensor[[pos_b], :]
-        self.top_p_tensor[[pos_b], :] = self.top_p_tensor[[self.real_state_size - 1], :]
+            self.top_p_tensor[[self.real_state_size - 1], :] = self.top_p_tensor[[pos_a], :]
+            self.top_p_tensor[[pos_a], :] = self.top_p_tensor[[pos_b], :]
+            self.top_p_tensor[[pos_b], :] = self.top_p_tensor[[self.real_state_size - 1], :]
 
-        self.top_k_tensor[[self.real_state_size - 1], :] = self.top_k_tensor[[pos_a], :]
-        self.top_k_tensor[[pos_a], :] = self.top_k_tensor[[pos_b], :]
-        self.top_k_tensor[[pos_b], :] = self.top_k_tensor[[self.real_state_size - 1], :]
+            self.top_k_tensor[[self.real_state_size - 1], :] = self.top_k_tensor[[pos_a], :]
+            self.top_k_tensor[[pos_a], :] = self.top_k_tensor[[pos_b], :]
+            self.top_k_tensor[[pos_b], :] = self.top_k_tensor[[self.real_state_size - 1], :]
 
-        self.presence_penalty_tensor[[self.real_state_size - 1], :] = self.presence_penalty_tensor[[pos_a], :]
-        self.presence_penalty_tensor[[pos_a], :] = self.presence_penalty_tensor[[pos_b], :]
-        self.presence_penalty_tensor[[pos_b], :] = self.presence_penalty_tensor[[self.real_state_size - 1], :]
+            self.presence_penalty_tensor[[self.real_state_size - 1], :] = self.presence_penalty_tensor[[pos_a], :]
+            self.presence_penalty_tensor[[pos_a], :] = self.presence_penalty_tensor[[pos_b], :]
+            self.presence_penalty_tensor[[pos_b], :] = self.presence_penalty_tensor[[self.real_state_size - 1], :]
 
     def _organize_batch(self):
         """返回 ([start_pos, end_pos),)
@@ -486,9 +516,10 @@ class Worker:
         if len(task.generated_tokens) >= task.max_tokens:
             task.request_status = RequestStatus.FINISHED_LENGTH_CAPPED
         else:
-            www = 0.0 if new_token in self.no_penalty_token_ids else 1.0
-            self.occurrence[slot_pos, new_token] += www
-            self.alpha_presence_vector[[slot_pos], [new_token]] = self.presence_penalty_tensor[[slot_pos], :]
+            if not self.enable_rapid_sampling:
+                www = 0.0 if new_token in self.no_penalty_token_ids else 1.0
+                self.occurrence[slot_pos, new_token] += www
+                self.alpha_presence_vector[[slot_pos], [new_token]] = self.presence_penalty_tensor[[slot_pos], :]
 
             task_data["next_input_token"] = new_token
 
@@ -556,48 +587,56 @@ class Worker:
                 self.batch_state[1][:, [slot_pos], :, :] = new_state[1]
                 self.batch_state[2][[slot_pos]] = new_state[2]
 
-                self.occurrence[[slot_pos], :] = torch.zeros(
-                    (1, self.model_config.vocab_size),
-                    dtype=torch.float32,
-                    device=self.batch_state[0].device,
-                )
+                if self.enable_rapid_sampling:
+                    # Rapid-Sampling penalties 初始化
+                    self.penalties[[slot_pos], :] = torch.zeros(
+                        (1, self.model_config.vocab_size),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                else:
+                    self.occurrence[[slot_pos], :] = torch.zeros(
+                        (1, self.model_config.vocab_size),
+                        dtype=torch.float32,
+                        device=self.batch_state[0].device,
+                    )
 
-                self.alpha_presence_vector[[slot_pos], :] = torch.zeros(
-                    (1, self.model_config.vocab_size),
-                    dtype=torch.float32,
-                    device=self.batch_state[0].device,
-                )
+                    self.alpha_presence_vector[[slot_pos], :] = torch.zeros(
+                        (1, self.model_config.vocab_size),
+                        dtype=torch.float32,
+                        device=self.batch_state[0].device,
+                    )
 
-                self.temperature_tensor[[slot_pos], :] = torch.tensor(
-                    [[task.temperature if task.temperature > 0 else 1.0]],
-                    dtype=torch.float16,
-                    device=device,
-                )
-                self.top_p_tensor[[slot_pos], :] = torch.tensor(
-                    [[task.top_p]],
-                    dtype=torch.float16,
-                    device=device,
-                )
-                self.top_k_tensor[[slot_pos], :] = torch.tensor(
-                    [[task.top_k]],
-                    dtype=torch.int32,
-                    device=device,
-                )
-                self.frequency_penalty_tensor[[slot_pos], :] = torch.tensor(
-                    [[task.frequency_penalty]],
-                    dtype=torch.float16,
-                    device=device,
-                )
-                self.penalty_decay_tensor[[slot_pos], :] = torch.tensor(
-                    [[task.penalty_decay]],
-                    dtype=torch.float16,
-                    device=device,
-                )
-                self.presence_penalty_tensor[[slot_pos], :] = torch.tensor(
-                    [[task.presence_penalty]],
-                    dtype=torch.float32,
-                    device=device,
-                )
+                    self.temperature_tensor[[slot_pos], :] = torch.tensor(
+                        [[task.temperature if task.temperature > 0 else 1.0]],
+                        dtype=torch.float16,
+                        device=device,
+                    )
+                    self.top_p_tensor[[slot_pos], :] = torch.tensor(
+                        [[task.top_p]],
+                        dtype=torch.float16,
+                        device=device,
+                    )
+                    self.top_k_tensor[[slot_pos], :] = torch.tensor(
+                        [[task.top_k]],
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    self.frequency_penalty_tensor[[slot_pos], :] = torch.tensor(
+                        [[task.frequency_penalty]],
+                        dtype=torch.float16,
+                        device=device,
+                    )
+                    self.penalty_decay_tensor[[slot_pos], :] = torch.tensor(
+                        [[task.penalty_decay]],
+                        dtype=torch.float16,
+                        device=device,
+                    )
+                    self.presence_penalty_tensor[[slot_pos], :] = torch.tensor(
+                        [[task.presence_penalty]],
+                        dtype=torch.float32,
+                        device=device,
+                    )
 
                 # 添加到 task_pool
 
@@ -658,19 +697,48 @@ class Worker:
             for forbidden_token in self.state_slot[slot_pos]["task"].forbidden_tokens:
                 out[slot_pos - decode_offset[0]][forbidden_token] -= 1e10
 
-        self.occurrence[decode_slice, :] *= self.penalty_decay_tensor[decode_slice, :]
-        out -= (
-            self.alpha_presence_vector[decode_slice, :]
-            + self.occurrence[decode_slice, :] * self.frequency_penalty_tensor[decode_slice, :]
-        )
+        if self.enable_rapid_sampling:
+            # 使用 Rapid-Sampling 进行采样
+            # rapid-sampling 使用默认参数
+            temperature = 1.0
+            top_k = 0  # 0 或 -1 表示不限制
+            top_p = 0.3
+            presence_penalty = 0.5
+            repetition_penalty = 0.5
+            penalty_decay = 0.996
 
-        # 采样
-        new_tokens = sample_logits_real_batch(
-            out,
-            self.temperature_tensor[decode_slice, :],
-            self.top_p_tensor[decode_slice, :],
-            self.top_k_tensor[decode_slice, :],
-        )
+            # 注意：rapid_sampling_states 是一个字节数组，每个 batch 元素占用固定字节
+            # 由于 _organize_batch 确保 decode 任务从索引 0 开始，decode_offset[0] 应为 0
+            # 这里使用完整的 states，内核会根据 logits 的 batch size 自动处理
+            batch_size = decode_offset[1] - decode_offset[0]
+            
+            new_tokens = self.rapid_sampling_module.batch_sampling_repetition_temperature_topk_topp(
+                out.float().contiguous(),
+                self.penalties[decode_slice, :].contiguous(),
+                self.rapid_sampling_states,  # 使用完整的 states
+                presence_penalty,
+                repetition_penalty,
+                penalty_decay,
+                temperature,
+                top_k,
+                top_p,
+            )
+            
+        else:
+            # 原始采样逻辑
+            self.occurrence[decode_slice, :] *= self.penalty_decay_tensor[decode_slice, :]
+            out -= (
+                self.alpha_presence_vector[decode_slice, :]
+                + self.occurrence[decode_slice, :] * self.frequency_penalty_tensor[decode_slice, :]
+            )
+
+            # 采样
+            new_tokens = sample_logits_real_batch(
+                out,
+                self.temperature_tensor[decode_slice, :],
+                self.top_p_tensor[decode_slice, :],
+                self.top_k_tensor[decode_slice, :],
+            )
 
         for slot_pos in range(*decode_offset):
             new_token = new_tokens[slot_pos - decode_offset[0]].item()
@@ -828,3 +896,9 @@ class Worker:
         del self.penalty_decay_tensor
         del self.presence_penalty_tensor
         del self.model
+
+        # Rapid-Sampling 清理
+        if self.enable_rapid_sampling:
+            del self.penalties
+            del self.rapid_sampling_states
+            self.rapid_sampling_module = None

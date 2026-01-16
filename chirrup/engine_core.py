@@ -137,6 +137,7 @@ class AsyncEngineCore:
                     master_event_queue=self.event_queue,
                     worker_event_queue=self.worker_event_queue,
                     batch_size=batch_size,
+                    # enable_rapid_sampling=True
                 )
 
                 self.workers.append(worker)

@@ -1,0 +1,3 @@
+[submodule "chirrup/utils/rapid_sampling"]
+	path = chirrup/utils/rapid_sampling
+	url = https://github.com/Triang-jyed-driung/Rapid-Sampling.git
