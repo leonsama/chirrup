@@ -84,7 +84,8 @@ _MODEL_COMPILE_DONE = False
 
 
 class StateCategory(IntEnum):
-    FORWARD_ONE = auto()
+    FORWARD_ONE_DECODE = auto()
+    FORWARD_ONE_PREFILL = auto()
     FORWARD_ONE_SUSPENDED = auto()
     FORWARD_SEQ = auto()
     FINISHED = auto()
@@ -358,11 +359,14 @@ class Worker:
 
     def _organize_batch(self):
         """返回 ([start_pos, end_pos),)
-
-        - 0: forward one
-        - 1: forward one suspended
-        - 2: seq prefill
-        - 3: finish"""
+        
+        按 StateCategory 排序后的偏移量列表：
+        - 0: forward one decode（需要 penalty 和采样）
+        - 1: forward one prefill（只需要 forward）
+        - 2: forward one suspended
+        - 3: seq prefill
+        - 4: finished
+        - 5: empty"""
         current_task_list = [None] * self.max_batch_size
 
         for slot_pos, task_data in sorted(self.state_slot.items()):
@@ -410,7 +414,7 @@ class Worker:
             #     task_data["prefilled_tokens"],
             #     self.tokenizer.decode(task_data["prefilled_tokens"], utf8_errors="ignore"),
             # )
-            task_data["state_category"] = StateCategory.FORWARD_ONE
+            task_data["state_category"] = StateCategory.FORWARD_ONE_PREFILL
 
             if task_data["task"].cache_prefill:
                 task_data["task"].output_queue.put_nowait(
@@ -429,11 +433,11 @@ class Worker:
                 task_data["prefill_cached"] = True
 
         if len(task_data["task"].prefill_tokens) == 0:
-            task_data["state_category"] = StateCategory.FORWARD_ONE
+            task_data["state_category"] = StateCategory.FORWARD_ONE_DECODE
             task_data["is_prefilling"] = False
 
         elif len(task_data["task"].prefill_tokens) < self.min_forward_seq_len:
-            task_data["state_category"] = StateCategory.FORWARD_ONE
+            task_data["state_category"] = StateCategory.FORWARD_ONE_PREFILL
         else:
             # task_data["state_category"] = StateCategory.FORWARD_SEQ
             pass
@@ -446,6 +450,7 @@ class Worker:
         task_data["next_input_token"] = task.prefill_tokens.pop(0)
         if len(task.prefill_tokens) == 0:
             task_data["is_prefilling"] = False
+            task_data["state_category"] = StateCategory.FORWARD_ONE_DECODE
 
         if (
             task_data["task"].cache_prefill
@@ -468,31 +473,35 @@ class Worker:
             )
             task_data["prefill_cached"] = True
 
-    def _handle_forward_one_decode_phase(self, task_data: TaskData, slot_pos: int):
-        """处理 Decode 阶段"""
+    def _handle_forward_one_decode_phase(self, task_data: TaskData, slot_pos: int) -> Optional[Tuple[int, int, float]]:
+        """处理 Decode 阶段
+        
+        Returns:
+            如果需要批量更新 penalty，返回 (slot_pos, new_token, weight)
+            否则返回 None
+        """
         task = task_data["task"]
         new_token = task_data["new_token"]
 
         if new_token in task.stop_tokens:
             task.request_status = RequestStatus.FINISHED_STOPPED
-            return
-        else:
+            return None
 
-            new_text = self.tokenizer.decode([new_token], utf8_errors="ignore")  # TODO: 处理不完整的 utf8
+        new_text = self.tokenizer.decode([new_token], utf8_errors="ignore")  # TODO: 处理不完整的 utf8
 
-            task.generated_tokens.append(new_token)
-            task.decoded_texts.append(new_text)
+        task.generated_tokens.append(new_token)
+        task.decoded_texts.append(new_text)
 
-            task.output_queue.put_nowait(("token_generated", (new_token, new_text)))
+        task.output_queue.put_nowait(("token_generated", (new_token, new_text)))
 
         if len(task.generated_tokens) >= task.max_tokens:
             task.request_status = RequestStatus.FINISHED_LENGTH_CAPPED
-        else:
-            www = 0.0 if new_token in self.no_penalty_token_ids else 1.0
-            self.occurrence[slot_pos, new_token] += www
-            self.alpha_presence_vector[[slot_pos], [new_token]] = self.presence_penalty_tensor[[slot_pos], :]
-
-            task_data["next_input_token"] = new_token
+            return None
+        
+        # 返回需要批量更新的信息，而不是在这里直接更新
+        weight = 0.0 if new_token in self.no_penalty_token_ids else 1.0
+        task_data["next_input_token"] = new_token
+        return (slot_pos, new_token, weight)
 
     def _is_task_aborted(self, task_data: TaskData):
         """检查任务是否打断"""
@@ -508,6 +517,28 @@ class Worker:
             pass
 
         return False
+
+    def _batch_update_penalty(self, penalty_updates: List[Tuple[int, int, float]]):
+        """批量更新 occurrence 和 alpha_presence_vector
+        
+        Args:
+            penalty_updates: List of (slot_pos, new_token, weight) tuples
+        """
+        if not penalty_updates:
+            return
+        
+        slots = torch.tensor([u[0] for u in penalty_updates], device=self.occurrence.device, dtype=torch.long)
+        tokens = torch.tensor([u[1] for u in penalty_updates], device=self.occurrence.device, dtype=torch.long)
+        weights = torch.tensor([u[2] for u in penalty_updates], device=self.occurrence.device, dtype=torch.float32)
+        
+        # 批量更新 occurrence: self.occurrence[slot_pos, new_token] += weight
+        self.occurrence[slots, tokens] += weights
+        
+        # 批量更新 alpha_presence_vector: 
+        # self.alpha_presence_vector[[slot_pos], [new_token]] = self.presence_penalty_tensor[[slot_pos], :]
+        # presence_penalty_tensor 是 (batch, 1)，需要取对应 slot 的值
+        presence_values = self.presence_penalty_tensor[slots, 0]
+        self.alpha_presence_vector[slots, tokens] = presence_values
 
     def _process_accomplished_tasks(self, accomplished_task_slot_pos: List[int]):
         """处理已完成的任务"""
@@ -606,10 +637,10 @@ class Worker:
                 next_input_token = task.prefill_tokens.pop(0)
 
                 if len(task.prefill_tokens) == 0:
-                    state_category = StateCategory.FORWARD_ONE
+                    state_category = StateCategory.FORWARD_ONE_DECODE
                     is_prefilling = False
                 elif len(task.prefill_tokens) - max((task.cache_prefill_padding - 1), 0) < self.min_forward_seq_len:
-                    state_category = StateCategory.FORWARD_ONE
+                    state_category = StateCategory.FORWARD_ONE_PREFILL
                     is_prefilling = True
                 else:
                     state_category = StateCategory.FORWARD_SEQ
@@ -629,55 +660,71 @@ class Worker:
             except queue.Empty:
                 break
 
-    def _run_forward_one(self, decode_offset: Tuple[int, int]):
-        """运行模型前向推理，单 token ，适合 decode 和 prefill 模式"""
+    def _run_forward_one(self, decode_offset: Tuple[int, int], one_prefill_offset: Tuple[int, int]):
+        """运行模型前向推理，单 token
+        
+        Args:
+            decode_offset: one decode 范围 [start, end)，需要 penalty 和采样
+            one_prefill_offset: one prefill 范围 [start, end)，只需要 forward
+        
+        注意：decode_offset 和 one_prefill_offset 是连续的，即 decode_offset[1] == one_prefill_offset[0]
+        """
+        
+        # 合并范围进行 forward
+        combined_start = decode_offset[0]
+        combined_end = one_prefill_offset[1]
+        combined_count = combined_end - combined_start
+        
+        if combined_count == 0:
+            return
 
         # 构建批处理输入
+        next_tokens = [None] * combined_count
 
-        next_tokens = [None] * (decode_offset[1] - decode_offset[0])
+        for slot_pos in range(combined_start, combined_end):
+            next_tokens[slot_pos - combined_start] = [self.state_slot[slot_pos]["next_input_token"]]
 
-        for slot_pos in range(*decode_offset):
-            next_tokens[slot_pos - decode_offset[0]] = [self.state_slot[slot_pos]["next_input_token"]]
-
-        decode_slice = slice(decode_offset[0], decode_offset[1])
+        combined_slice = slice(combined_start, combined_end)
 
         forward_state = [
-            self.batch_state[0][:, :, decode_slice, :],
-            self.batch_state[1][:, decode_slice, :, :],
-            self.batch_state[2][decode_slice],
+            self.batch_state[0][:, :, combined_slice, :],
+            self.batch_state[1][:, combined_slice, :, :],
+            self.batch_state[2][combined_slice],
         ]
 
-        # print("fo", next_tokens)
-
-        # 模型前向传播
-        # x1 = time.perf_counter()
+        # 模型前向传播（对所有 one forward 任务）
         out = self.model.forward_seq_batch(next_tokens, forward_state)
-        # x2 = time.perf_counter()
-        # print(f"forward time: {(x2-x1):.4f}")
 
-        # 处理禁止 token
-        for slot_pos in range(*decode_offset):
-            for forbidden_token in self.state_slot[slot_pos]["task"].forbidden_tokens:
-                out[slot_pos - decode_offset[0]][forbidden_token] -= 1e10
+        # 以下只对 decode 范围进行处理
+        decode_count = decode_offset[1] - decode_offset[0]
+        
+        if decode_count > 0:
+            decode_slice = slice(decode_offset[0], decode_offset[1])
+            decode_out = out[:decode_count]  # 取 decode 部分的输出
 
-        # 原始采样逻辑
-        self.occurrence[decode_slice, :] *= self.penalty_decay_tensor[decode_slice, :]
-        out -= (
-            self.alpha_presence_vector[decode_slice, :]
-            + self.occurrence[decode_slice, :] * self.frequency_penalty_tensor[decode_slice, :]
-        )
+            # 处理禁止 token（只对 decode）
+            for slot_pos in range(*decode_offset):
+                for forbidden_token in self.state_slot[slot_pos]["task"].forbidden_tokens:
+                    decode_out[slot_pos - decode_offset[0]][forbidden_token] -= 1e10
 
-        # 采样
-        new_tokens = sample_logits_real_batch(
-            out,
-            self.temperature_tensor[decode_slice, :],
-            self.top_p_tensor[decode_slice, :],
-            self.top_k_tensor[decode_slice, :],
-        )
+            # penalty 计算（只对 decode）
+            self.occurrence[decode_slice, :] *= self.penalty_decay_tensor[decode_slice, :]
+            decode_out -= (
+                self.alpha_presence_vector[decode_slice, :]
+                + self.occurrence[decode_slice, :] * self.frequency_penalty_tensor[decode_slice, :]
+            )
 
-        for slot_pos in range(*decode_offset):
-            new_token = new_tokens[slot_pos - decode_offset[0]].item()
-            self.state_slot[slot_pos]["new_token"] = new_token
+            # 采样（只对 decode）
+            new_tokens = sample_logits_real_batch(
+                decode_out,
+                self.temperature_tensor[decode_slice, :],
+                self.top_p_tensor[decode_slice, :],
+                self.top_k_tensor[decode_slice, :],
+            )
+
+            for slot_pos in range(*decode_offset):
+                new_token = new_tokens[slot_pos - decode_offset[0]].item()
+                self.state_slot[slot_pos]["new_token"] = new_token
 
         del out
 
@@ -739,6 +786,7 @@ class Worker:
                 break
 
             accomplished_task_slot_pos: list[int] = []
+            penalty_updates: list[Tuple[int, int, float]] = []  # 收集需要批量更新的 penalty 数据
 
             for key, task_data in sorted(self.state_slot.items()):
 
@@ -756,29 +804,36 @@ class Worker:
                 elif task_data["state_category"] == StateCategory.FORWARD_SEQ:
                     self._handle_forward_seq(task_data, key)
 
-                elif task_data["state_category"] == StateCategory.FORWARD_ONE:
-                    if task_data["is_prefilling"]:
-                        self._handle_forward_one_prefill_phase(task_data, key)
-                    else:
-                        self._handle_forward_one_decode_phase(task_data, key)
+                elif task_data["state_category"] == StateCategory.FORWARD_ONE_PREFILL:
+                    self._handle_forward_one_prefill_phase(task_data, key)
+
+                elif task_data["state_category"] == StateCategory.FORWARD_ONE_DECODE:
+                    update_info = self._handle_forward_one_decode_phase(task_data, key)
+                    if update_info is not None:
+                        penalty_updates.append(update_info)
 
                 if RequestStatus.is_finished(task_data["task"].request_status):
                     accomplished_task_slot_pos.append(key)
+
+            # 批量更新 penalty（原来是在循环内逐个更新）
+            self._batch_update_penalty(penalty_updates)
 
             self._process_accomplished_tasks(accomplished_task_slot_pos)
 
             self._fill_task_pool()
 
-            decode_offset, decode_suspended_offset, seq_perfill_offset, accomplished_offset, empty_offset = (
+            decode_offset, one_prefill_offset, decode_suspended_offset, seq_perfill_offset, accomplished_offset, empty_offset = (
                 self._organize_batch()
             )
 
-            if decode_offset[1] - decode_offset[0] == 0 and seq_perfill_offset[1] - seq_perfill_offset[0] == 0:
+            if decode_offset[1] - decode_offset[0] == 0 and one_prefill_offset[1] - one_prefill_offset[0] == 0 and seq_perfill_offset[1] - seq_perfill_offset[0] == 0:
                 time.sleep(0.05)
                 continue
 
-            if decode_offset[1] - decode_offset[0] > 0:
-                self._run_forward_one(decode_offset)
+            # 检查是否有 one forward 任务（decode 或 one prefill）
+            one_forward_count = one_prefill_offset[1] - decode_offset[0]
+            if one_forward_count > 0:
+                self._run_forward_one(decode_offset, one_prefill_offset)
                 self.seq_forward_count_down -= 1
             else:
                 self.seq_forward_count_down = 0
@@ -790,7 +845,8 @@ class Worker:
             self.loop_time_recorder.append(time.perf_counter() - loop_start_time)
 
             if self.worker_event_queue:
-                decode_count = sum([1 for i in range(*decode_offset) if self.state_slot[i]["is_prefilling"] == False])
+                decode_count = decode_offset[1] - decode_offset[0]
+                one_prefill_count = one_prefill_offset[1] - one_prefill_offset[0]
                 info = (
                     self.worker_id,
                     "worker_performance",
@@ -799,14 +855,15 @@ class Worker:
                         "state_size": self.real_state_size,
                         "state_offset_details": {
                             "decode_offset": decode_offset,
+                            "one_prefill_offset": one_prefill_offset,
                             "decode_suspended_offset": decode_suspended_offset,
                             "seq_perfill_offset": seq_perfill_offset,
                             "accomplished_offset": accomplished_offset,
                         },
                         "task_details": {
                             "decode_count": decode_count,
-                            "one_prefill_count": decode_offset[1] - decode_offset[0] - decode_count,
-                            "seq_perfill_count": seq_perfill_offset[1] - seq_perfill_offset[0],
+                            "one_prefill_count": one_prefill_count,
+                            "seq_prefill_count": seq_perfill_offset[1] - seq_perfill_offset[0],
                         },
                         "max_allocated_memory_GB": torch.cuda.max_memory_allocated() / 1024**3,
                     },

@@ -43,11 +43,13 @@ from Albatross.utils import TRIE_TOKENIZER
 
 
 def infer(states, out, temperature, top_p, top_k, BSZ, tokenizer):
-    tokens_tensor = sample_logits_real_batch(out, temperature=temperature, top_p=top_p, top_k=top_k)
-    tokens = [[int(item)] for item in tokens_tensor]
-    for i in range(BSZ):
-        tokenizer.decode(tokens[i],utf8_errors="ignore")
-        
+    # tokens_tensor = sample_logits_real_batch(out, temperature=temperature, top_p=top_p, top_k=top_k)
+    # tokens = [[int(item)] for item in tokens_tensor]
+    # for i in range(BSZ):
+    #     tokenizer.decode(tokens[i],utf8_errors="ignore")
+
+    tokens = [[1086] for item in range(BSZ)]
+
     x1 = time.perf_counter()
     out =  model.forward_seq_batch(tokens, states)
     x2 = time.perf_counter()
