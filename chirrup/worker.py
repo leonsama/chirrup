@@ -9,7 +9,7 @@ import torch
 from collections import deque
 
 from chirrup.core_structure import Task, ModelLoadConfig, RequestStatus, FinishReason
-from chirrup.utils.samplers import sample_logits_real_batch
+from chirrup.utils.samplers import sample_logits_rwkv_pip_compatible as sample_logits_real_batch
 # from chirrup.utils.rapid_sampling_wrapper import load_rapid_sampling
 
 # 定义TaskData的类型结构

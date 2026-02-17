@@ -13,7 +13,7 @@ args.head_size = 64
 #
 # model download: https://huggingface.co/BlinkDL/rwkv7-g1
 #
-args.MODEL_NAME = "../models/rwkv7-g0a3-7.2b-20251029-ctx8192"
+args.MODEL_NAME = "../models/rwkv7-g1c-7.2b-20251231-ctx8192"
 
 from Albatross.rwkv7 import RWKV_x070 as RWKV_x070_ORIGINAL
 
@@ -41,7 +41,7 @@ from Albatross.utils import TRIE_TOKENIZER
 tokenizer = TRIE_TOKENIZER("./Albatross/rwkv_vocab_v20230424.txt")
 
 
-BSZ = 16
+BSZ = 1
 STEP = 1000
 
 prompt = "User: 为什么爱会消失？\nAssistant: "
