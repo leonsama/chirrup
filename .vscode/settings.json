@@ -1,3 +1,9 @@
 {
-  "black-formatter.args": ["--line-length", "120"]
+  "black-formatter.args": [
+    "--line-length",
+    "120"
+  ],
+  // "chat.tools.terminal.autoApprove": {
+  //   "uv": true
+  // }
 }
