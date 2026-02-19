@@ -381,21 +381,29 @@ class RWKV_x070(MyModule):
             state[2] += len(idxs[0])
             return x
 
-    def get_gpu_parameter_groups(self):
+    def get_gpu_parameter_groups(self, print_details=True):
             """
             return: list[{size:int, keys:list[str]}]
             """
+
+            prxxx = print if print_details else lambda *args, **kwargs: None
+
             groups = []
             
             # 1. _forward_seq_batch_pre
             pre_keys = [f'emb.weight',"blocks.0.ln0.weight","blocks.0.ln0.bias"]
             pre_size = sum(self.z[k].numel() * self.z[k].element_size() for k in pre_keys)
             groups.append({'size': pre_size, 'keys': pre_keys})
+            prxxx(f"[pre] total={pre_size / 1024 / 1024:.2f} MB")
+            for k in pre_keys:
+                s = self.z[k].numel() * self.z[k].element_size()
+                prxxx(f"  {k}: {list(self.z[k].shape)} {self.z[k].dtype} {s / 1024 / 1024:.4f} MB")
             
             # 2. _forward_seq_batch_layers
             for i in range(self.n_layer):
                 layer_keys = []
                 layer_size = 0
+                param_details = []
                 
                 # Layer norm 1
                 bbb = f'blocks.{i}.'
@@ -406,62 +414,88 @@ class RWKV_x070(MyModule):
                 for k in ['ln1.weight', 'ln1.bias']:
                     key = bbb + k
                     layer_keys.append(key)
-                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                    s = self.z[key].numel() * self.z[key].element_size()
+                    layer_size += s
+                    param_details.append((key, s))
                 
                 # attention parameters
                 for k in ['x_r', 'x_w', 'x_k', 'x_v', 'x_a', 'x_g']:
                     key = att + k
                     layer_keys.append(key)
-                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                    s = self.z[key].numel() * self.z[key].element_size()
+                    layer_size += s
+                    param_details.append((key, s))
                 
                 # attention weights
                 for k in ['w0', 'w1', 'w2']:
                     key = att + k
                     layer_keys.append(key)
-                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                    s = self.z[key].numel() * self.z[key].element_size()
+                    layer_size += s
+                    param_details.append((key, s))
                 
                 # attention a/v/g parameters
                 for k in ['a0', 'a1', 'a2', 'v0', 'v1', 'v2', 'g1', 'g2']:
                     key = att + k
                     layer_keys.append(key)
-                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                    s = self.z[key].numel() * self.z[key].element_size()
+                    layer_size += s
+                    param_details.append((key, s))
                 
                 # attention k/k_a/r_k
                 for k in ['k_k', 'k_a', 'r_k']:
                     key = att + k
                     layer_keys.append(key)
-                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                    s = self.z[key].numel() * self.z[key].element_size()
+                    layer_size += s
+                    param_details.append((key, s))
                 
                 # attention linear weights
                 for k in ['receptance.weight', 'key.weight', 'value.weight', 'output.weight']:
                     key = att + k
                     layer_keys.append(key)
-                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                    s = self.z[key].numel() * self.z[key].element_size()
+                    layer_size += s
+                    param_details.append((key, s))
                 
                 # attention layer norm
                 for k in ['ln_x.weight', 'ln_x.bias']:
                     key = att + k
                     layer_keys.append(key)
-                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                    s = self.z[key].numel() * self.z[key].element_size()
+                    layer_size += s
+                    param_details.append((key, s))
                 
                 # ffn layer norm
                 for k in ['ln2.weight', 'ln2.bias']:
                     key = bbb + k
                     layer_keys.append(key)
-                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                    s = self.z[key].numel() * self.z[key].element_size()
+                    layer_size += s
+                    param_details.append((key, s))
                 
                 # ffn parameters
                 for k in ['x_k', 'key.weight', 'value.weight']:
                     key = ffn + k
                     layer_keys.append(key)
-                    layer_size += self.z[key].numel() * self.z[key].element_size()
+                    s = self.z[key].numel() * self.z[key].element_size()
+                    layer_size += s
+                    param_details.append((key, s))
                 
                 groups.append({'size': layer_size, 'keys': layer_keys})
+                
+                prxxx(f"[layer {i}] total={layer_size / 1024 / 1024:.2f} MB")
+                for key, s in param_details:
+                    prxxx(f"  {key}: {list(self.z[key].shape)} {self.z[key].dtype} {s / 1024 / 1024:.4f} MB")
             
             # 3. _forward_seq_batch_post
             post_keys = ['ln_out.weight', 'ln_out.bias', 'head.weight']
             post_size = sum(self.z[k].numel() * self.z[k].element_size() for k in post_keys)
             groups.append({'size': post_size, 'keys': post_keys})
+            prxxx(f"[post] total={post_size / 1024 / 1024:.2f} MB")
+            for k in post_keys:
+                s = self.z[k].numel() * self.z[k].element_size()
+                prxxx(f"  {k}: {list(self.z[k].shape)} {self.z[k].dtype} {s / 1024 / 1024:.4f} MB")
             
             return groups
 
