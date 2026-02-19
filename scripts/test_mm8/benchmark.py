@@ -41,6 +41,8 @@ print("CUDA extensions compiled.\n")
 
 N = 4096       # activation inner dim
 M = 16384      # weight output dim
+BSZ = 16       # batch size for 3D test
+N_EMB = 23     # sequence / embedding dim for 3D test
 DEVICE = "cuda"
 DTYPE = torch.float16
 
@@ -144,6 +146,21 @@ def cuda_mm8_one(N, M, x, w, mx, rx, my, ry):
     torch.ops.rwkv_pip.mm8_one(N, M, x, w, mx, rx, my, ry, y)
     return y.to(dtype=x.dtype)
 
+# ======================= Implementation 3b: Optimized CUDA mm8_seq =======================
+# N-dimension splitting + shared memory caching (see rwkv_pip_operators.cu)
+
+def cuda_mm8_seq_opt(B, N, M, x, w, mx, rx, my, ry):
+    assert x.dtype == mx.dtype == rx.dtype == my.dtype == ry.dtype
+    assert x.dtype == torch.float32 or x.dtype == torch.float16
+    assert w.dtype == torch.uint8
+    assert x.shape == (B, N)
+    assert w.shape == (N, M)
+    assert rx.shape == mx.shape == (M,)
+    assert ry.shape == my.shape == (N, 1)
+    y = torch.empty((B, M), device=w.device, dtype=x.dtype)
+    torch.ops.rwkv_pip.mm8_seq_opt(B, N, M, x, w, mx, rx, my, ry, y)
+    return y
+
 # ======================= Implementation 4: Albatross PyTorch mm8 =======================
 # Copied from Albatross/rwkv7.py (mm8_seq_op -> torch_mm8_seq / mm8_one_op -> torch_mm8_one)
 
@@ -174,6 +191,59 @@ def albatross_torch_mm8_one(x, w, mx, rx, my, ry):
     x_sum = x.sum()                     # scalar
     xmy_sum = (x * my_flat).sum()       # scalar
     return (rx_flat * (core + 0.5 * xs_sum) + xmy_sum + mx_flat * x_sum).to(dtype=x.dtype)
+
+# ======================= Reshape wrappers (2D/3D transparent) =======================
+# Each wrapper flattens leading dims to 2D, calls the underlying seq op, reshapes back.
+
+def _flatten_leading(x):
+    """If x is 3D+ [*, C], return (x_2d [B*T, C], original_shape). Else (x, None)."""
+    if x.dim() > 2:
+        return x.reshape(-1, x.shape[-1]), x.shape
+    return x, None
+
+def _unflatten(y, orig_shape):
+    """Restore leading dims: [B*T, M] -> [*orig_leading, M]."""
+    if orig_shape is not None:
+        return y.reshape(*orig_shape[:-1], -1)
+    return y
+
+def pytorch_fp16_matmul_seq_3d(x, w_fp16):
+    x_2d, shape = _flatten_leading(x)
+    return _unflatten(x_2d @ w_fp16, shape)
+
+def cublas_gemm_fp16_seq_3d(x, w_fp16):
+    x_2d, shape = _flatten_leading(x)
+    c = torch.empty((x_2d.shape[0], w_fp16.shape[-1]), dtype=x.dtype, device=x.device)
+    torch.ops.rwkv_pip.gemm_fp16_cublas(x_2d, w_fp16, c)
+    return _unflatten(c, shape)
+
+def rwkv_pip_torch_mm8_seq_3d(x, w, mx, rx, my, ry):
+    x_2d, shape = _flatten_leading(x)
+    y = rwkv_pip_torch_mm8_seq(x_2d, w, mx, rx, my, ry)
+    return _unflatten(y, shape)
+
+def cuda_mm8_seq_3d(x, w, mx, rx, my, ry):
+    """Wrapper: auto-compute B from x, handle 2D/3D."""
+    x_2d, shape = _flatten_leading(x)
+    B_flat = x_2d.shape[0]
+    N_inner = x_2d.shape[1]
+    M_out = w.shape[1]
+    y = cuda_mm8_seq(B_flat, N_inner, M_out, x_2d, w, mx, rx, my, ry)
+    return _unflatten(y, shape)
+
+def cuda_mm8_seq_opt_3d(x, w, mx, rx, my, ry):
+    """Wrapper: optimized cuda_mm8_seq, handle 2D/3D."""
+    x_2d, shape = _flatten_leading(x)
+    B_flat = x_2d.shape[0]
+    N_inner = x_2d.shape[1]
+    M_out = w.shape[1]
+    y = cuda_mm8_seq_opt(B_flat, N_inner, M_out, x_2d, w, mx, rx, my, ry)
+    return _unflatten(y, shape)
+
+def albatross_torch_mm8_seq_3d(x, w, mx, rx, my, ry):
+    x_2d, shape = _flatten_leading(x)
+    y = albatross_torch_mm8_seq(x_2d, w, mx, rx, my, ry)
+    return _unflatten(y, shape)
 
 # =============================== Benchmark utility ===============================
 
@@ -207,15 +277,15 @@ def benchmark(fn, warmup=WARMUP, repeats=REPEATS, label=""):
 
 def main():
     print("=" * 80)
-    print("mm8 benchmark:  x[1,4096] @ w[4096,16384]   (fp16, CUDA)")
+    print(f"mm8 benchmark:  x[{BSZ},{N_EMB},{N}] @ w[{N},{M}]   (fp16, CUDA)")
     print("=" * 80)
 
     torch.manual_seed(42)
 
     # ---- Create test data ----
-    x_2d = torch.randn(1, N, dtype=DTYPE, device=DEVICE)    # [1, N]
-    x_1d = x_2d.squeeze(0)                                   # [N]
-    w_fp16 = torch.randn(N, M, dtype=DTYPE, device=DEVICE)   # [N, M]
+    x_3d = torch.randn(BSZ, N_EMB, N, dtype=DTYPE, device=DEVICE)  # [BSZ, N_EMB, N]
+    x_1d = torch.randn(N, dtype=DTYPE, device=DEVICE)              # [N]
+    w_fp16 = torch.randn(N, M, dtype=DTYPE, device=DEVICE)         # [N, M]
 
     # Quantise
     w_q, mx, rx, my, ry = quantize_weight(w_fp16)
@@ -225,72 +295,74 @@ def main():
     my   = my.to(device=DEVICE)
     ry   = ry.to(device=DEVICE)
 
-    print(f"\nShapes:  x_2d={list(x_2d.shape)}  x_1d={list(x_1d.shape)}")
+    print(f"\nShapes:  x_3d={list(x_3d.shape)}  x_1d={list(x_1d.shape)}")
     print(f"         w_fp16={list(w_fp16.shape)}  w_q={list(w_q.shape)} (uint8)")
     print(f"         mx={list(mx.shape)}  rx={list(rx.shape)}  my={list(my.shape)}  ry={list(ry.shape)}")
     print(f"\nWarmup={WARMUP}  Repeats={REPEATS}")
     print()
 
-    results = []
+    seq_results = []
+    one_results = []
 
-    # ====== 0. Baseline: PyTorch native fp16 @ (seq) ======
-    avg, mn, mx_t = benchmark(lambda: pytorch_fp16_matmul_seq(x_2d, w_fp16))
-    results.append(("PyTorch fp16 @ (seq [1,N]@[N,M])", avg, mn, mx_t))
+    # ==================== SEQ benchmarks (3D: [BSZ, N_EMB, N] @ [N, M]) ====================
 
-    # ====== 0b. Baseline: PyTorch native fp16 @ (one) ======
+    avg, mn, mx_t = benchmark(lambda: pytorch_fp16_matmul_seq_3d(x_3d, w_fp16))
+    seq_results.append(("PyTorch fp16 @ (seq)", avg, mn, mx_t))
+
+    avg, mn, mx_t = benchmark(lambda: cublas_gemm_fp16_seq_3d(x_3d, w_fp16))
+    seq_results.append(("rwkv pip cuBLAS gemm_fp16 (seq)", avg, mn, mx_t))
+
+    avg, mn, mx_t = benchmark(lambda: rwkv_pip_torch_mm8_seq_3d(x_3d, w_q, mx, rx, my, ry))
+    seq_results.append(("rwkv pip torch_mm8_seq", avg, mn, mx_t))
+
+    avg, mn, mx_t = benchmark(lambda: cuda_mm8_seq_3d(x_3d, w_q, mx, rx, my, ry))
+    seq_results.append(("rwkv pip cuda_mm8_seq", avg, mn, mx_t))
+
+    avg, mn, mx_t = benchmark(lambda: cuda_mm8_seq_opt_3d(x_3d, w_q, mx, rx, my, ry))
+    seq_results.append(("rwkv pip cuda_mm8_seq (optimized)", avg, mn, mx_t))
+
+    avg, mn, mx_t = benchmark(lambda: albatross_torch_mm8_seq_3d(x_3d, w_q, mx, rx, my, ry))
+    seq_results.append(("Albatross torch_mm8_seq", avg, mn, mx_t))
+
+    # ==================== ONE benchmarks (1D: [N] @ [N, M]) ====================
+
     avg, mn, mx_t = benchmark(lambda: pytorch_fp16_matmul_one(x_1d, w_fp16))
-    results.append(("PyTorch fp16 @ (one [N]@[N,M])", avg, mn, mx_t))
+    one_results.append(("PyTorch fp16 @ (one)", avg, mn, mx_t))
 
-    # ====== 1. rwkv pip cuBLAS gemm (seq) ======
-    avg, mn, mx_t = benchmark(lambda: cublas_gemm_fp16_seq(x_2d, w_fp16))
-    results.append(("rwkv pip cuBLAS gemm_fp16 (seq)", avg, mn, mx_t))
-
-    # ====== 1b. rwkv pip cuBLAS gemm (one) ======
     avg, mn, mx_t = benchmark(lambda: cublas_gemm_fp16_one(x_1d, w_fp16))
-    results.append(("rwkv pip cuBLAS gemm_fp16 (one)", avg, mn, mx_t))
+    one_results.append(("rwkv pip cuBLAS gemm_fp16 (one)", avg, mn, mx_t))
 
-    # ====== 2. rwkv pip PyTorch fallback (seq) ======
-    avg, mn, mx_t = benchmark(lambda: rwkv_pip_torch_mm8_seq(x_2d, w_q, mx, rx, my, ry))
-    results.append(("rwkv pip torch_mm8_seq", avg, mn, mx_t))
-
-    # ====== 2b. rwkv pip PyTorch fallback (one) ======
     avg, mn, mx_t = benchmark(lambda: rwkv_pip_torch_mm8_one(x_1d, w_q, mx, rx, my, ry))
-    results.append(("rwkv pip torch_mm8_one", avg, mn, mx_t))
+    one_results.append(("rwkv pip torch_mm8_one", avg, mn, mx_t))
 
-    # ====== 3. rwkv pip CUDA kernel (seq, B=1) ======
-    avg, mn, mx_t = benchmark(lambda: cuda_mm8_seq(1, N, M, x_2d, w_q, mx, rx, my, ry))
-    results.append(("rwkv pip cuda_mm8_seq", avg, mn, mx_t))
-
-    # ====== 3b. rwkv pip CUDA kernel (one) ======
     avg, mn, mx_t = benchmark(lambda: cuda_mm8_one(N, M, x_1d, w_q, mx, rx, my, ry))
-    results.append(("rwkv pip cuda_mm8_one", avg, mn, mx_t))
+    one_results.append(("rwkv pip cuda_mm8_one", avg, mn, mx_t))
 
-    # ====== 4. Albatross PyTorch mm8 (seq, B=1) ======
-    avg, mn, mx_t = benchmark(lambda: albatross_torch_mm8_seq(x_2d, w_q, mx, rx, my, ry))
-    results.append(("Albatross torch_mm8_seq", avg, mn, mx_t))
-
-    # ====== 4b. Albatross PyTorch mm8 (one) ======
     avg, mn, mx_t = benchmark(lambda: albatross_torch_mm8_one(x_1d, w_q, mx, rx, my, ry))
-    results.append(("Albatross torch_mm8_one", avg, mn, mx_t))
+    one_results.append(("Albatross torch_mm8_one", avg, mn, mx_t))
 
     # ===================== Print latency results =====================
-    print("-" * 90)
-    print(f"{'Implementation':<45} {'Avg(μs)':>10} {'Min(μs)':>10} {'Max(μs)':>10}")
-    print("-" * 90)
-    for name, avg, mn, mx_t in results:
-        print(f"{name:<45} {avg:>10.1f} {mn:>10.1f} {mx_t:>10.1f}")
-    print("-" * 90)
 
-    # Speedup relative to PyTorch fp16 @ (seq)
-    baseline_avg = results[0][1]
-    print(f"\n{'Implementation':<45} {'Speedup vs PyTorch fp16@':>25}")
-    print("-" * 72)
-    for name, avg, _, _ in results:
-        speedup = baseline_avg / avg if avg > 0 else float('inf')
-        print(f"{name:<45} {speedup:>21.2f}x")
-    print("-" * 72)
+    def print_latency_table(title, results_list):
+        print(f"\n{'--- ' + title + ' ---'}")
+        print("-" * 90)
+        print(f"{'Implementation':<45} {'Avg(μs)':>10} {'Min(μs)':>10} {'Max(μs)':>10}")
+        print("-" * 90)
+        for name, avg, mn, mx_t in results_list:
+            print(f"{name:<45} {avg:>10.1f} {mn:>10.1f} {mx_t:>10.1f}")
+        print("-" * 90)
+        baseline_avg = results_list[0][1]
+        print(f"\n{'Implementation':<45} {'Speedup vs baseline':>25}")
+        print("-" * 72)
+        for name, avg, _, _ in results_list:
+            speedup = baseline_avg / avg if avg > 0 else float('inf')
+            print(f"{name:<45} {speedup:>21.2f}x")
+        print("-" * 72)
 
-    # ===================== Correctness check (vs fp16 ground truth) =====================
+    print_latency_table(f"SEQ mode: x[{BSZ},{N_EMB},{N}] @ w[{N},{M}]", seq_results)
+    print_latency_table(f"ONE mode: x[{N}] @ w[{N},{M}]", one_results)
+
+    # ===================== Correctness check =====================
     def error_metrics(ref, y):
         """Compute max_abs_err, mean_abs_err, relative_l2_err, cosine_similarity."""
         diff = (ref - y).float()
@@ -303,30 +375,46 @@ def main():
         cos_sim  = F.cosine_similarity(ref_f.view(1, -1), y_f.view(1, -1)).item()
         return max_abs, mean_abs, rel_l2, cos_sim
 
-    ref_seq = (x_2d @ w_fp16)          # [1, M] fp16 ground truth
-    ref_one = (x_1d @ w_fp16)          # [M]    fp16 ground truth
+    def print_correctness_table(title, checks_list):
+        print(f"\n{'=== Correctness: ' + title + ' ==='}")
+        hdr = f"{'Implementation':<35} {'MaxAbs':>10} {'MeanAbs':>10} {'RelL2':>10} {'CosSim':>10}"
+        print(hdr)
+        print("-" * len(hdr))
+        for name, ref, y in checks_list:
+            ma, mea, rl2, cs = error_metrics(ref, y)
+            print(f"{name:<35} {ma:>10.6f} {mea:>10.6f} {rl2:>10.6f} {cs:>10.8f}")
 
-    checks = []
-    # cuBLAS gemm
-    checks.append(("cuBLAS gemm_fp16 (seq)", ref_seq, cublas_gemm_fp16_seq(x_2d, w_fp16)))
-    checks.append(("cuBLAS gemm_fp16 (one)", ref_one, cublas_gemm_fp16_one(x_1d, w_fp16)))
-    # rwkv pip torch fallback
-    checks.append(("rwkv pip torch_mm8_seq", ref_seq, rwkv_pip_torch_mm8_seq(x_2d, w_q, mx, rx, my, ry)))
-    checks.append(("rwkv pip torch_mm8_one", ref_one, rwkv_pip_torch_mm8_one(x_1d, w_q, mx, rx, my, ry)))
-    # rwkv pip CUDA kernel
-    checks.append(("rwkv pip cuda_mm8_seq",  ref_seq, cuda_mm8_seq(1, N, M, x_2d, w_q, mx, rx, my, ry)))
-    checks.append(("rwkv pip cuda_mm8_one",  ref_one, cuda_mm8_one(N, M, x_1d, w_q, mx, rx, my, ry)))
-    # Albatross torch mm8
-    checks.append(("Albatross torch_mm8_seq", ref_seq, albatross_torch_mm8_seq(x_2d, w_q, mx, rx, my, ry)))
-    checks.append(("Albatross torch_mm8_one", ref_one, albatross_torch_mm8_one(x_1d, w_q, mx, rx, my, ry)))
+    ref_seq_fp16 = pytorch_fp16_matmul_seq_3d(x_3d, w_fp16)  # fp16 ground truth
+    ref_one_fp16 = (x_1d @ w_fp16)
 
-    print(f"\n{'=== Correctness vs fp16 ground truth (x @ w_fp16) ==='}")
-    hdr = f"{'Implementation':<35} {'MaxAbs':>10} {'MeanAbs':>10} {'RelL2':>10} {'CosSim':>10}"
-    print(hdr)
-    print("-" * len(hdr))
-    for name, ref, y in checks:
-        ma, mea, rl2, cs = error_metrics(ref, y)
-        print(f"{name:<35} {ma:>10.6f} {mea:>10.6f} {rl2:>10.6f} {cs:>10.8f}")
+    torch_mm8_seq = rwkv_pip_torch_mm8_seq_3d(x_3d, w_q, mx, rx, my, ry)
+    torch_mm8_one = rwkv_pip_torch_mm8_one(x_1d, w_q, mx, rx, my, ry)
+
+    # --- Part 1: PyTorch fp16 vs rwkv pip torch_mm8 (quantization error baseline) ---
+    print_correctness_table("SEQ: PyTorch fp16 vs torch_mm8", [
+        ("rwkv pip torch_mm8", ref_seq_fp16, torch_mm8_seq),
+    ])
+    print_correctness_table("ONE: PyTorch fp16 vs torch_mm8", [
+        ("rwkv pip torch_mm8", ref_one_fp16, torch_mm8_one),
+    ])
+
+    # --- Part 2: All implementations vs torch_mm8 baseline ---
+    seq_checks = [
+        ("PyTorch fp16 @",          torch_mm8_seq, ref_seq_fp16),
+        ("cuBLAS gemm_fp16",        torch_mm8_seq, cublas_gemm_fp16_seq_3d(x_3d, w_fp16)),
+        ("rwkv pip cuda_mm8",       torch_mm8_seq, cuda_mm8_seq_3d(x_3d, w_q, mx, rx, my, ry)),
+        ("rwkv pip cuda_mm8 (opt)", torch_mm8_seq, cuda_mm8_seq_opt_3d(x_3d, w_q, mx, rx, my, ry)),
+        ("Albatross torch_mm8",     torch_mm8_seq, albatross_torch_mm8_seq_3d(x_3d, w_q, mx, rx, my, ry)),
+    ]
+    one_checks = [
+        ("PyTorch fp16 @",          torch_mm8_one, ref_one_fp16),
+        ("cuBLAS gemm_fp16",        torch_mm8_one, cublas_gemm_fp16_one(x_1d, w_fp16)),
+        ("rwkv pip cuda_mm8",       torch_mm8_one, cuda_mm8_one(N, M, x_1d, w_q, mx, rx, my, ry)),
+        ("Albatross torch_mm8",     torch_mm8_one, albatross_torch_mm8_one(x_1d, w_q, mx, rx, my, ry)),
+    ]
+
+    print_correctness_table("SEQ vs torch_mm8 baseline", seq_checks)
+    print_correctness_table("ONE vs torch_mm8 baseline", one_checks)
 
 
 if __name__ == "__main__":
