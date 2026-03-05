@@ -12,7 +12,11 @@ class CachePrefill(TypedDict):
     prefilled_tokens: List[int]
 
 
-TASK_RETURN_TYPE = Union[Tuple[Literal["token"], int, str], Tuple[Literal["cache_prefill"], CachePrefill]]
+TASK_RETURN_TYPE = Union[
+    Tuple[Literal["token"], int, str],
+    Tuple[Literal["token"], int, str, torch.Tensor],
+    Tuple[Literal["cache_prefill"], CachePrefill],
+]
 
 
 class ResultChannel(Protocol):
@@ -50,6 +54,7 @@ class AsyncEngineCompletion:
         max_tokens: Optional[int] = DEFAULT_SAMPLING_CONFIG["max_tokens"],
         cache_prefill: bool = False,
         cache_prefill_padding: int = 0,
+        return_logits: bool = False,
     ):
         self.task_id = task_id
 
@@ -79,6 +84,7 @@ class AsyncEngineCompletion:
             forbidden_tokens=forbidden_tokens if forbidden_tokens is not None else [],
             cache_prefill=cache_prefill,
             cache_prefill_padding=cache_prefill_padding,
+            return_logits=return_logits,
         )
 
         self._task_queue = task_queue
@@ -109,7 +115,7 @@ class AsyncEngineCompletion:
             if isinstance(out, tuple) and len(out) == 2:
                 message_type, payload = out
                 if message_type == "token_generated":
-                    return ("token", *payload)
+                    return ("token", *payload)  # ("token", id, text) or ("token", id, text, logits)
                 elif message_type == "task_completed":
                     self.is_finished = True
                     self.task = payload

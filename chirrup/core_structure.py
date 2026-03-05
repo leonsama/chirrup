@@ -157,6 +157,7 @@ class Task:
 
     cache_prefill: bool = field(default=False)
     cache_prefill_padding: int = field(default=0)
+    return_logits: bool = field(default=False)
 
     # Internal state (not part of public API)
     event_list: List = field(init=False, default_factory=list)

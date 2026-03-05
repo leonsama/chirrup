@@ -101,6 +101,7 @@ class TaskData(TypedDict):
     state_category: StateCategory
     prefilled_tokens: List[int]
     prefill_cached: bool
+    raw_logits: Optional[torch.Tensor]
 
 
 class Worker:
@@ -150,6 +151,7 @@ class Worker:
                 "new_token": None,
                 "next_input_token": None,
                 "state_category": StateCategory.EMPTY,
+                "raw_logits": None,
             }
             for i in range(self.max_batch_size)
         }
@@ -492,7 +494,11 @@ class Worker:
         task.generated_tokens.append(new_token)
         task.decoded_texts.append(new_text)
 
-        task.output_queue.put_nowait(("token_generated", (new_token, new_text)))
+        if task.return_logits and task_data["raw_logits"] is not None:
+            task.output_queue.put_nowait(("token_generated", (new_token, new_text, task_data["raw_logits"])))
+            task_data["raw_logits"] = None
+        else:
+            task.output_queue.put_nowait(("token_generated", (new_token, new_text)))
 
         if len(task.generated_tokens) >= task.max_tokens:
             task.request_status = RequestStatus.FINISHED_LENGTH_CAPPED
@@ -558,6 +564,7 @@ class Worker:
                 "next_input_token": None,
                 "state_category": StateCategory.EMPTY,
                 "prefilled_tokens": [],
+                "raw_logits": None,
             }
 
     def _fill_task_pool(self):
@@ -654,6 +661,7 @@ class Worker:
                     "state_category": state_category,
                     "prefilled_tokens": [],
                     "prefill_cached": False,
+                    "raw_logits": None,
                 }
                 self.state_slot[slot_pos] = task_data
 
@@ -693,7 +701,7 @@ class Worker:
         ]
 
         # 模型前向传播（对所有 one forward 任务）
-        out = self.model.forward_seq_batch(next_tokens, forward_state)
+        out = self.model.forward_seq_batch_seperate(next_tokens, forward_state)
 
         # 以下只对 decode 范围进行处理
         decode_count = decode_offset[1] - decode_offset[0]
@@ -701,6 +709,11 @@ class Worker:
         if decode_count > 0:
             decode_slice = slice(decode_offset[0], decode_offset[1])
             decode_out = out[:decode_count]  # 取 decode 部分的输出
+
+            # 捕获原始 logits（penalty 之前）用于需要 return_logits 的任务
+            for slot_pos in range(*decode_offset):
+                if self.state_slot[slot_pos]["task"].return_logits:
+                    self.state_slot[slot_pos]["raw_logits"] = decode_out[slot_pos - decode_offset[0]].clone().detach().cpu()
 
             # 处理禁止 token（只对 decode）
             for slot_pos in range(*decode_offset):
@@ -759,7 +772,7 @@ class Worker:
             self.batch_state[2][seq_perfill_offset[0] : seq_perfill_offset[1]],
         ]
         # print("fs", next_tokens)
-        out = self.model.forward_batch(next_tokens, seq_forward_state)
+        out = self.model.forward_seq_batch_seperate(next_tokens, seq_forward_state)
         del out
 
     def start(self):

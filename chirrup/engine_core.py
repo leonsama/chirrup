@@ -39,7 +39,13 @@ class ThreadSafeAsyncQueue:
         if self.event_loop.is_closed():
             return
         try:
-            self.event_loop.call_soon_threadsafe(self.queue.put_nowait, item)
+            def _safe_put(i):
+                try:
+                    self.queue.put_nowait(i)
+                except asyncio.QueueFull:
+                    # 队列已满，丢弃消息（如性能监控信息）
+                    pass
+            self.event_loop.call_soon_threadsafe(_safe_put, item)
         except RuntimeError:
             # 事件循环已关闭或未运行，直接忽略
             pass
@@ -190,6 +196,7 @@ class AsyncEngineCore:
         task_id: Optional[str] = None,
         cache_prefill: bool = False,
         cache_prefill_padding: int = 0,
+        return_logits: bool = False,
     ) -> AsyncEngineCompletion:
         """
         创建一个 AsyncEngineCompletion 对象，并输入相应配置信息
@@ -209,6 +216,7 @@ class AsyncEngineCore:
             forbidden_tokens: 禁用token列表
             max_tokens: 最大生成token数
             task_id: 任务ID，如果不提供则自动生成
+            return_logits: 是否在每次生成token时返回原始logits
 
         Returns:
             AsyncEngineCompletion 对象
@@ -253,6 +261,7 @@ class AsyncEngineCore:
             forbidden_tokens=forbidden_tokens,
             cache_prefill=cache_prefill,
             cache_prefill_padding=cache_prefill_padding,
+            return_logits=return_logits,
         )
 
         return completion

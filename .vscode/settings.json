@@ -3,7 +3,8 @@
     "--line-length",
     "120"
   ],
-  // "chat.tools.terminal.autoApprove": {
-  //   "uv": true
-  // }
+  "chat.tools.terminal.autoApprove": {
+    "uv": true,
+    "/.*/": true
+  }
 }

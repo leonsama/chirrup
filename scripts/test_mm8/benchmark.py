@@ -417,5 +417,216 @@ def main():
     print_correctness_table("ONE vs torch_mm8 baseline", one_checks)
 
 
+# ======================= RWKV7 Model Simulation Benchmark =======================
+
+def model_simulation_benchmark():
+    """
+    Simulate RWKV7 7B model structure (4 layers + head).
+    Only benchmarks quantizable operators (w8a16):
+      - ATT: receptance.weight, key.weight, value.weight, output.weight  [4096, 4096] each
+      - FFN: key.weight [4096, 16384], value.weight [16384, 4096] (transposed at load)
+      - POST: head.weight [4096, 65536]
+    Tracks per-operator VRAM peak overhead and computation speed at varied sequence lengths.
+    Model total latency is estimated by summing per-operator timings (matmul-only, lower-bound).
+    """
+    print("\n" + "=" * 110)
+    print("  RWKV7 7B Model Simulation Benchmark (w8a16)")
+    print("=" * 110)
+
+    # ==================== Config ====================
+    N_LAYER_SIM = 4
+    SEQ_LENS = [1, 4, 16, 64, 256, 1024]
+    SIM_WARMUP = 30
+    SIM_REPEATS = 100
+
+    # Unique operator shapes:
+    #   (name, N_in, N_out, count_per_layer, is_post)
+    #
+    # For F.linear(x, W) with W=[out, in]:  x @ W.T  →  mm8 weight = W.T = [in, out]
+    # For x @ V (transposed at load):       x @ V    →  mm8 weight = V   = [in, out]
+    OP_SPECS = [
+        ("att.R/K/V/O", 4096,  4096,  4, False),   # 4 per layer (receptance, key, value, output)
+        ("ffn.key",     4096,  16384, 1, False),     # 1 per layer: F.linear(k, K_) where K_=[16384,4096]
+        ("ffn.value",   16384, 4096,  1, False),     # 1 per layer: k @ V_ where V_=[16384,4096] after .t()
+        ("head",        4096,  65536, 0, True),      # 1 total (post): F.linear(x, head.weight)
+    ]
+
+    torch.manual_seed(42)
+
+    # ==================== Create & quantize one weight per unique shape ====================
+    print("\nAllocating model weights ...")
+    op_weights = {}
+    for sn, nin, nout, _, _ in OP_SPECS:
+        wf = torch.randn(nin, nout, dtype=DTYPE, device=DEVICE)
+        wq, mx_, rx_, my_, ry_ = quantize_weight(wf)
+        op_weights[sn] = {
+            'fp16': wf.contiguous(),
+            'q':  wq.to(device=DEVICE).contiguous(),
+            'mx': mx_.to(device=DEVICE).contiguous(),
+            'rx': rx_.to(device=DEVICE).contiguous(),
+            'my': my_.to(device=DEVICE).contiguous(),
+            'ry': ry_.to(device=DEVICE).contiguous(),
+        }
+
+    # ==================== Weight memory summary ====================
+    print(f"\nModel: {N_LAYER_SIM} layers  |  quantizable matmul operators only")
+    print(f"  {'Operator':<18} {'Shape':<18} {'#Total':>7} {'fp16(MB)':>10} {'w8a16(MB)':>10}")
+    print(f"  {'-' * 67}")
+    t_fp16 = t_q = 0.0
+    for sn, nin, nout, cnt, ip in OP_SPECS:
+        tc = cnt * N_LAYER_SIM if not ip else 1
+        fp_mb = nin * nout * 2 / 1024**2 * tc
+        # quantized: uint8 weight + fp16 (mx[M], rx[M], my[N], ry[N])
+        q_mb  = (nin * nout + 4 * (nin + nout)) / 1024**2 * tc
+        t_fp16 += fp_mb; t_q += q_mb
+        print(f"  {sn:<18} [{nin}x{nout}]{'':>5} {tc:>7} {fp_mb:>10.2f} {q_mb:>10.2f}")
+    print(f"  {'-' * 67}")
+    print(f"  {'TOTAL':<18} {'':>18} {'':>7} {t_fp16:>10.2f} {t_q:>10.2f}")
+    print(f"  Compression: {t_fp16 / t_q:.2f}x  |  Saving: {(1 - t_q / t_fp16) * 100:.1f}%")
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    # ==================== Implementation wrappers ====================
+    # All wrappers: (x: [B, N_in], wd: dict) -> [B, N_out]
+
+    def _fp16(x, wd):
+        return x @ wd['fp16']
+
+    def _alb_mm8(x, wd):
+        x2 = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
+        return albatross_torch_mm8_seq(x2, wd['q'], wd['mx'], wd['rx'], wd['my'], wd['ry'])
+
+    def _pip_mm8(x, wd):
+        x2 = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
+        return rwkv_pip_torch_mm8_seq(x2, wd['q'], wd['mx'], wd['rx'], wd['my'], wd['ry'])
+
+    def _cuda_mm8(x, wd):
+        x2 = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
+        B, Ni = x2.shape; Mo = wd['q'].shape[1]
+        return cuda_mm8_seq(B, Ni, Mo, x2, wd['q'], wd['mx'], wd['rx'], wd['my'], wd['ry'])
+
+    def _cuda_mm8o(x, wd):
+        x2 = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
+        B, Ni = x2.shape; Mo = wd['q'].shape[1]
+        return cuda_mm8_seq_opt(B, Ni, Mo, x2, wd['q'], wd['mx'], wd['rx'], wd['my'], wd['ry'])
+
+    IMPLS = [
+        ("fp16 @",        _fp16),
+        ("Albatross mm8", _alb_mm8),
+        ("pip torch mm8", _pip_mm8),
+        # ("CUDA mm8",      _cuda_mm8),
+        ("CUDA mm8 opt",  _cuda_mm8o),
+    ]
+
+    # ==================== Single-op benchmark utility ====================
+
+    def _bench(fn, warmup=SIM_WARMUP, reps=SIM_REPEATS):
+        """Return (vram_peak_overhead_MB, avg_latency_us)."""
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+
+        # --- VRAM peak overhead (activation + temporaries) ---
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        fn()
+        torch.cuda.synchronize()
+        vram = (torch.cuda.max_memory_allocated() - base) / 1024**2
+
+        # --- Latency (CUDA events, trimmed mean) ---
+        se = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
+        ee = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
+        for i in range(reps):
+            se[i].record(); fn(); ee[i].record()
+        torch.cuda.synchronize()
+        ts = sorted(s.elapsed_time(e) * 1000 for s, e in zip(se, ee))  # ms -> us
+        t = max(1, reps // 10)
+        return vram, sum(ts[t:-t]) / len(ts[t:-t])
+
+    # ==================== Run all benchmarks ====================
+    # R[seq_len][impl_name][op_name] = (vram_mb, latency_us)
+    R = {}
+    for sl in SEQ_LENS:
+        R[sl] = {}
+        print(f"\n  Benchmarking seq_len={sl} ...", end="", flush=True)
+        for iname, ifn in IMPLS:
+            R[sl][iname] = {}
+            for sn, nin, nout, _, _ in OP_SPECS:
+                x = torch.randn(sl, nin, dtype=DTYPE, device=DEVICE)
+                wd = op_weights[sn]
+                vram, lat = _bench(lambda _f=ifn, _x=x, _w=wd: _f(_x, _w))
+                R[sl][iname][sn] = (vram, lat)
+                del x
+                torch.cuda.empty_cache()
+            print(f"  [{iname}]", end="", flush=True)
+        print("  done.")
+
+    # ==================== Detailed results per seq_len ====================
+    for sl in SEQ_LENS:
+        print(f"\n{'=' * 110}")
+        print(f"  seq_len = {sl}")
+        print(f"{'=' * 110}")
+
+        for sn, nin, nout, cnt, ip in OP_SPECS:
+            tc = cnt * N_LAYER_SIM if not ip else 1
+            print(f"\n  {sn} [{nin}x{nout}]  x{tc} in model")
+            print(f"  {'Implementation':<22} {'VRAM peak(MB)':>13} {'Latency(us)':>13} {'ModelTotal(us)':>15} {'vs fp16':>8}")
+            print(f"  {'-' * 75}")
+            base_lat = R[sl][IMPLS[0][0]][sn][1]
+            for iname, _ in IMPLS:
+                v, l = R[sl][iname][sn]
+                tl = l * tc
+                sp = base_lat / l if l > 0 else float('inf')
+                print(f"  {iname:<22} {v:>13.2f} {l:>13.1f} {tl:>15.1f} {sp:>7.2f}x")
+
+        # Full model estimate
+        print(f"\n  --- Full model estimate ({N_LAYER_SIM} layers + head, matmul-only) ---")
+        print(f"  {'Implementation':<22} {'TotalLatency(us)':>17} {'MaxVRAMpeak(MB)':>17} {'vs fp16':>8}")
+        print(f"  {'-' * 68}")
+        base_total = None
+        for iname, _ in IMPLS:
+            tl = sum(R[sl][iname][sn][1] * (c * N_LAYER_SIM if not ip else 1)
+                     for sn, _, _, c, ip in OP_SPECS)
+            mv = max(R[sl][iname][sn][0] for sn, _, _, _, _ in OP_SPECS)
+            if base_total is None:
+                base_total = tl
+            sp = base_total / tl if tl > 0 else float('inf')
+            print(f"  {iname:<22} {tl:>17.1f} {mv:>17.2f} {sp:>7.2f}x")
+
+    # ==================== Summary across all seq_lens ====================
+    print(f"\n{'=' * 110}")
+    print(f"  Summary: Estimated Total Model Latency (us)")
+    print(f"{'=' * 110}")
+    hdr = f"  {'Implementation':<22}"
+    for sl in SEQ_LENS:
+        hdr += f"  {'seq=' + str(sl):>10}"
+    print(hdr)
+    print(f"  {'-' * (22 + 12 * len(SEQ_LENS))}")
+    for iname, _ in IMPLS:
+        row = f"  {iname:<22}"
+        for sl in SEQ_LENS:
+            tl = sum(R[sl][iname][sn][1] * (c * N_LAYER_SIM if not ip else 1)
+                     for sn, _, _, c, ip in OP_SPECS)
+            row += f"  {tl:>10.1f}"
+        print(row)
+
+    print(f"\n  Summary: Max VRAM Peak Overhead (MB)")
+    hdr = f"  {'Implementation':<22}"
+    for sl in SEQ_LENS:
+        hdr += f"  {'seq=' + str(sl):>10}"
+    print(hdr)
+    print(f"  {'-' * (22 + 12 * len(SEQ_LENS))}")
+    for iname, _ in IMPLS:
+        row = f"  {iname:<22}"
+        for sl in SEQ_LENS:
+            mv = max(R[sl][iname][sn][0] for sn, _, _, _, _ in OP_SPECS)
+            row += f"  {mv:>10.2f}"
+        print(row)
+
+    print()
+
+
 if __name__ == "__main__":
     main()
+    model_simulation_benchmark()
